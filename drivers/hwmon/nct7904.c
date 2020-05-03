@@ -7,6 +7,11 @@
  *
  * Copyright (c) 2019 Advantech
  * Author: Amy.Shih <amy.shih@advantech.com.tw>
+ *
+ * Supports the following chips:
+ *
+ * Chip        #vin  #fan  #pwm  #temp  #dts  chip ID
+ * nct7904d     20    12    4     5      8    0xc5
  */
 
 #include <linux/module.h>
@@ -81,6 +86,10 @@
 #define TSI_CTRL_REG		0x50	/* Bank 2; TSI Control Register */
 #define FANCTL1_FMR_REG		0x00	/* Bank 3; 1 reg per channel */
 #define FANCTL1_OUT_REG		0x10	/* Bank 3; 1 reg per channel */
+
+#define VOLT_MONITOR_MODE	0x0
+#define THERMAL_DIODE_MODE	0x1
+#define THERMISTOR_MODE		0x3
 
 #define ENABLE_TSI	BIT(1)
 
@@ -816,6 +825,10 @@ static const struct hwmon_channel_info *nct7904_info[] = {
 			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
 			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
 			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
+			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM,
 			   HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_ALARM),
 	HWMON_CHANNEL_INFO(pwm,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
@@ -823,6 +836,18 @@ static const struct hwmon_channel_info *nct7904_info[] = {
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
 			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	HWMON_CHANNEL_INFO(temp,
+			   HWMON_T_INPUT | HWMON_T_ALARM | HWMON_T_MAX |
+			   HWMON_T_MAX_HYST | HWMON_T_TYPE | HWMON_T_CRIT |
+			   HWMON_T_CRIT_HYST,
+			   HWMON_T_INPUT | HWMON_T_ALARM | HWMON_T_MAX |
+			   HWMON_T_MAX_HYST | HWMON_T_TYPE | HWMON_T_CRIT |
+			   HWMON_T_CRIT_HYST,
+			   HWMON_T_INPUT | HWMON_T_ALARM | HWMON_T_MAX |
+			   HWMON_T_MAX_HYST | HWMON_T_TYPE | HWMON_T_CRIT |
+			   HWMON_T_CRIT_HYST,
+			   HWMON_T_INPUT | HWMON_T_ALARM | HWMON_T_MAX |
+			   HWMON_T_MAX_HYST | HWMON_T_TYPE | HWMON_T_CRIT |
+			   HWMON_T_CRIT_HYST,
 			   HWMON_T_INPUT | HWMON_T_ALARM | HWMON_T_MAX |
 			   HWMON_T_MAX_HYST | HWMON_T_TYPE | HWMON_T_CRIT |
 			   HWMON_T_CRIT_HYST,
@@ -935,11 +960,16 @@ static int nct7904_probe(struct i2c_client *client,
 	for (i = 0; i < 4; i++) {
 		val = (ret >> (i * 2)) & 0x03;
 		bit = (1 << i);
-		if (val == 0) {
+		if (val == VOLT_MONITOR_MODE) {
 			data->tcpu_mask &= ~bit;
+		} else if (val == THERMAL_DIODE_MODE && i < 2) {
+			data->temp_mode |= bit;
+			data->vsen_mask &= ~(0x06 << (i * 2));
+		} else if (val == THERMISTOR_MODE) {
+			data->vsen_mask &= ~(0x02 << (i * 2));
 		} else {
-			if (val == 0x1 || val == 0x2)
-				data->temp_mode |= bit;
+			/* Reserved */
+			data->tcpu_mask &= ~bit;
 			data->vsen_mask &= ~(0x06 << (i * 2));
 		}
 	}

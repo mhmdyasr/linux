@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: BSD-3-Clause
- * Copyright (c) 2016-2018, NXP Semiconductors
+/* SPDX-License-Identifier: BSD-3-Clause */
+/* Copyright (c) 2016-2018, NXP Semiconductors
  * Copyright (c) 2018-2019, Vladimir Oltean <olteanv@gmail.com>
  */
 #ifndef _SJA1105_STATIC_CONFIG_H
@@ -230,6 +230,7 @@ struct sja1105_l2_policing_entry {
 };
 
 struct sja1105_avb_params_entry {
+	u64 cas_master;
 	u64 destmeta;
 	u64 srcmeta;
 };
