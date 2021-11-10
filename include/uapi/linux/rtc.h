@@ -99,6 +99,7 @@ struct rtc_pll_info {
 #define RTC_VL_BACKUP_LOW	_BITUL(1) /* Backup voltage is low */
 #define RTC_VL_BACKUP_EMPTY	_BITUL(2) /* Backup empty or not present */
 #define RTC_VL_ACCURACY_LOW	_BITUL(3) /* Voltage is low, RTC accuracy is reduced */
+#define RTC_VL_BACKUP_SWITCH	_BITUL(4) /* Backup switchover happened */
 
 #define RTC_VL_READ	_IOR('p', 0x13, unsigned int)	/* Voltage low detection */
 #define RTC_VL_CLR	_IO('p', 0x14)		/* Clear voltage low information */
@@ -109,6 +110,11 @@ struct rtc_pll_info {
 #define RTC_AF 0x20	/* Alarm interrupt */
 #define RTC_UF 0x10	/* Update interrupt for 1Hz RTC */
 
+/* feature list */
+#define RTC_FEATURE_ALARM		0
+#define RTC_FEATURE_ALARM_RES_MINUTE	1
+#define RTC_FEATURE_NEED_WEEK_DAY	2
+#define RTC_FEATURE_CNT			3
 
 #define RTC_MAX_FREQ	8192
 

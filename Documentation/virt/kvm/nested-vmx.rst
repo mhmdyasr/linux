@@ -22,7 +22,7 @@ its implementation and its performance characteristics, in the OSDI 2010 paper
 "The Turtles Project: Design and Implementation of Nested Virtualization",
 available at:
 
-	http://www.usenix.org/events/osdi10/tech/full_papers/Ben-Yehuda.pdf
+	https://www.usenix.org/events/osdi10/tech/full_papers/Ben-Yehuda.pdf
 
 
 Terminology
@@ -37,8 +37,10 @@ call L2.
 Running nested VMX
 ------------------
 
-The nested VMX feature is disabled by default. It can be enabled by giving
-the "nested=1" option to the kvm-intel module.
+The nested VMX feature is enabled by default since Linux kernel v4.20. For
+older Linux kernel, it can be enabled by giving the "nested=1" option to the
+kvm-intel module.
+
 
 No modifications are required to user space (qemu). However, qemu's default
 emulated CPU type (qemu64) does not list the "VMX" CPU feature, so it must be
@@ -116,10 +118,7 @@ struct shadow_vmcs is ever changed.
 		natural_width cr4_guest_host_mask;
 		natural_width cr0_read_shadow;
 		natural_width cr4_read_shadow;
-		natural_width cr3_target_value0;
-		natural_width cr3_target_value1;
-		natural_width cr3_target_value2;
-		natural_width cr3_target_value3;
+		natural_width dead_space[4]; /* Last remnants of cr3_target_value[0-3]. */
 		natural_width exit_qualification;
 		natural_width guest_linear_address;
 		natural_width guest_cr0;

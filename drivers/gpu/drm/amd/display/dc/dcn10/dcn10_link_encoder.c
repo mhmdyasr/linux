@@ -90,7 +90,8 @@ static const struct link_encoder_funcs dcn10_lnk_enc_funcs = {
 	.is_dig_enabled = dcn10_is_dig_enabled,
 	.get_dig_frontend = dcn10_get_dig_frontend,
 	.get_dig_mode = dcn10_get_dig_mode,
-	.destroy = dcn10_link_encoder_destroy
+	.destroy = dcn10_link_encoder_destroy,
+	.get_max_link_cap = dcn10_link_encoder_get_max_link_cap,
 };
 
 static enum bp_result link_transmitter_control(
@@ -479,7 +480,6 @@ unsigned int dcn10_get_dig_frontend(struct link_encoder *enc)
 		break;
 	default:
 		// invalid source select DIG
-		ASSERT(false);
 		result = ENGINE_ID_UNKNOWN;
 	}
 
@@ -618,10 +618,16 @@ bool dcn10_link_encoder_validate_dvi_output(
 static bool dcn10_link_encoder_validate_hdmi_output(
 	const struct dcn10_link_encoder *enc10,
 	const struct dc_crtc_timing *crtc_timing,
+	const struct dc_edid_caps *edid_caps,
 	int adjusted_pix_clk_100hz)
 {
 	enum dc_color_depth max_deep_color =
 			enc10->base.features.max_hdmi_deep_color;
+
+	// check pixel clock against edid specified max TMDS clk
+	if (edid_caps->max_tmds_clk_mhz != 0 &&
+			adjusted_pix_clk_100hz > edid_caps->max_tmds_clk_mhz * 10000)
+		return false;
 
 	if (max_deep_color < crtc_timing->display_color_depth)
 		return false;
@@ -800,6 +806,7 @@ bool dcn10_link_encoder_validate_output_with_stream(
 		is_valid = dcn10_link_encoder_validate_hdmi_output(
 				enc10,
 				&stream->timing,
+				&stream->sink->edid_caps,
 				stream->phy_pix_clk * 10);
 	break;
 	case SIGNAL_TYPE_DISPLAY_PORT:
@@ -946,6 +953,21 @@ void dcn10_link_encoder_enable_tmds_output(
 			__func__);
 		BREAK_TO_DEBUGGER();
 	}
+}
+
+void dcn10_link_encoder_enable_tmds_output_with_clk_pattern_wa(
+	struct link_encoder *enc,
+	enum clock_source_id clock_source,
+	enum dc_color_depth color_depth,
+	enum signal_type signal,
+	uint32_t pixel_clock)
+{
+	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
+
+	dcn10_link_encoder_enable_tmds_output(
+		enc, clock_source, color_depth, signal, pixel_clock);
+
+	REG_UPDATE(DIG_CLOCK_PATTERN, DIG_CLOCK_PATTERN, 0x1F);
 }
 
 /* enables DP PHY output */
@@ -1370,7 +1392,6 @@ void dcn10_link_encoder_disable_hpd(struct link_encoder *enc)
 			DC_HPD_EN, 0);
 }
 
-
 #define AUX_REG(reg)\
 	(enc10->aux_regs->reg)
 
@@ -1425,3 +1446,28 @@ enum signal_type dcn10_get_dig_mode(
 	return SIGNAL_TYPE_NONE;
 }
 
+void dcn10_link_encoder_get_max_link_cap(struct link_encoder *enc,
+	struct dc_link_settings *link_settings)
+{
+	/* Set Default link settings */
+	struct dc_link_settings max_link_cap = {LANE_COUNT_FOUR, LINK_RATE_HIGH,
+			LINK_SPREAD_05_DOWNSPREAD_30KHZ, false, 0};
+
+	/* Higher link settings based on feature supported */
+	if (enc->features.flags.bits.IS_HBR2_CAPABLE)
+		max_link_cap.link_rate = LINK_RATE_HIGH2;
+
+	if (enc->features.flags.bits.IS_HBR3_CAPABLE)
+		max_link_cap.link_rate = LINK_RATE_HIGH3;
+
+	if (enc->features.flags.bits.IS_UHBR10_CAPABLE)
+		max_link_cap.link_rate = LINK_RATE_UHBR10;
+
+	if (enc->features.flags.bits.IS_UHBR13_5_CAPABLE)
+		max_link_cap.link_rate = LINK_RATE_UHBR13_5;
+
+	if (enc->features.flags.bits.IS_UHBR20_CAPABLE)
+		max_link_cap.link_rate = LINK_RATE_UHBR20;
+
+	*link_settings = max_link_cap;
+}

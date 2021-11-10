@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2018 Texas Instruments Incorporated - http://www.ti.com/
+ * Copyright (C) 2018 Texas Instruments Incorporated - https://www.ti.com/
  * Author: Tomi Valkeinen <tomi.valkeinen@ti.com>
  */
 
@@ -16,7 +16,7 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_gem_cma_helper.h>
-#include <drm/drm_irq.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_probe_helper.h>
 
 #include "tidss_dispc.h"
@@ -102,34 +102,21 @@ static const struct dev_pm_ops tidss_pm_ops = {
 
 static void tidss_release(struct drm_device *ddev)
 {
-	struct tidss_device *tidss = ddev->dev_private;
-
 	drm_kms_helper_poll_fini(ddev);
-
-	tidss_modeset_cleanup(tidss);
-
-	drm_dev_fini(ddev);
-
-	kfree(tidss);
 }
 
 DEFINE_DRM_GEM_CMA_FOPS(tidss_fops);
 
-static struct drm_driver tidss_driver = {
+static const struct drm_driver tidss_driver = {
 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops			= &tidss_fops,
 	.release		= tidss_release,
-	DRM_GEM_CMA_VMAP_DRIVER_OPS,
+	DRM_GEM_CMA_DRIVER_OPS_VMAP,
 	.name			= "tidss",
 	.desc			= "TI Keystone DSS",
 	.date			= "20180215",
 	.major			= 1,
 	.minor			= 0,
-
-	.irq_preinstall		= tidss_irq_preinstall,
-	.irq_postinstall	= tidss_irq_postinstall,
-	.irq_handler		= tidss_irq_handler,
-	.irq_uninstall		= tidss_irq_uninstall,
 };
 
 static int tidss_probe(struct platform_device *pdev)
@@ -142,25 +129,17 @@ static int tidss_probe(struct platform_device *pdev)
 
 	dev_dbg(dev, "%s\n", __func__);
 
-	/* Can't use devm_* since drm_device's lifetime may exceed dev's */
-	tidss = kzalloc(sizeof(*tidss), GFP_KERNEL);
-	if (!tidss)
-		return -ENOMEM;
+	tidss = devm_drm_dev_alloc(&pdev->dev, &tidss_driver,
+				   struct tidss_device, ddev);
+	if (IS_ERR(tidss))
+		return PTR_ERR(tidss);
 
 	ddev = &tidss->ddev;
-
-	ret = devm_drm_dev_init(&pdev->dev, ddev, &tidss_driver);
-	if (ret) {
-		kfree(ddev);
-		return ret;
-	}
 
 	tidss->dev = dev;
 	tidss->feat = of_device_get_match_data(dev);
 
 	platform_set_drvdata(pdev, tidss);
-
-	ddev->dev_private = tidss;
 
 	ret = dispc_init(tidss);
 	if (ret) {
@@ -187,10 +166,11 @@ static int tidss_probe(struct platform_device *pdev)
 		ret = irq;
 		goto err_runtime_suspend;
 	}
+	tidss->irq = irq;
 
-	ret = drm_irq_install(ddev, irq);
+	ret = tidss_irq_install(ddev, irq);
 	if (ret) {
-		dev_err(dev, "drm_irq_install failed: %d\n", ret);
+		dev_err(dev, "tidss_irq_install failed: %d\n", ret);
 		goto err_runtime_suspend;
 	}
 
@@ -211,7 +191,7 @@ static int tidss_probe(struct platform_device *pdev)
 	return 0;
 
 err_irq_uninstall:
-	drm_irq_uninstall(ddev);
+	tidss_irq_uninstall(ddev);
 
 err_runtime_suspend:
 #ifndef CONFIG_PM
@@ -234,7 +214,7 @@ static int tidss_remove(struct platform_device *pdev)
 
 	drm_atomic_helper_shutdown(ddev);
 
-	drm_irq_uninstall(ddev);
+	tidss_irq_uninstall(ddev);
 
 #ifndef CONFIG_PM
 	/* If we don't have PM, we need to call suspend manually */

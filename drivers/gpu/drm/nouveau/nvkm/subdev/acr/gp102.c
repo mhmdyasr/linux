@@ -270,12 +270,14 @@ gp102_acr_load(struct nvkm_acr *acr, int ver, const struct nvkm_acr_fwif *fwif)
 
 static const struct nvkm_acr_fwif
 gp102_acr_fwif[] = {
-	{ 0, gp102_acr_load, &gp102_acr },
+	{  0, gp102_acr_load, &gp102_acr },
+	{ -1, gm200_acr_nofw, &gm200_acr },
 	{}
 };
 
 int
-gp102_acr_new(struct nvkm_device *device, int index, struct nvkm_acr **pacr)
+gp102_acr_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst,
+	      struct nvkm_acr **pacr)
 {
-	return nvkm_acr_new_(gp102_acr_fwif, device, index, pacr);
+	return nvkm_acr_new_(gp102_acr_fwif, device, type, inst, pacr);
 }

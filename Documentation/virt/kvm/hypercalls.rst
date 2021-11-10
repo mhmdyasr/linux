@@ -22,7 +22,7 @@ S390:
   number in R1.
 
   For further information on the S390 diagnose call as supported by KVM,
-  refer to Documentation/virt/kvm/s390-diag.txt.
+  refer to Documentation/virt/kvm/s390-diag.rst.
 
 PowerPC:
   It uses R3-R10 and hypercall number in R11. R4-R11 are used as output registers.
@@ -30,7 +30,7 @@ PowerPC:
 
   KVM hypercalls uses 4 byte opcode, that are patched with 'hypercall-instructions'
   property inside the device tree's /hypervisor node.
-  For more information refer to Documentation/virt/kvm/ppc-pv.txt
+  For more information refer to Documentation/virt/kvm/ppc-pv.rst
 
 MIPS:
   KVM hypercalls use the HYPCALL instruction with code 0 and the hypercall
@@ -169,3 +169,24 @@ a0: destination APIC ID
 
 :Usage example: When sending a call-function IPI-many to vCPUs, yield if
 	        any of the IPI target vCPUs was preempted.
+
+8. KVM_HC_MAP_GPA_RANGE
+-------------------------
+:Architecture: x86
+:Status: active
+:Purpose: Request KVM to map a GPA range with the specified attributes.
+
+a0: the guest physical address of the start page
+a1: the number of (4kb) pages (must be contiguous in GPA space)
+a2: attributes
+
+    Where 'attributes' :
+        * bits  3:0 - preferred page size encoding 0 = 4kb, 1 = 2mb, 2 = 1gb, etc...
+        * bit     4 - plaintext = 0, encrypted = 1
+        * bits 63:5 - reserved (must be zero)
+
+**Implementation note**: this hypercall is implemented in userspace via
+the KVM_CAP_EXIT_HYPERCALL capability. Userspace must enable that capability
+before advertising KVM_FEATURE_HC_MAP_GPA_RANGE in the guest CPUID.  In
+addition, if the guest supports KVM_FEATURE_MIGRATION_CONTROL, userspace
+must also set up an MSR filter to process writes to MSR_KVM_MIGRATION_CONTROL.

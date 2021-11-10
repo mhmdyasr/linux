@@ -18,9 +18,14 @@
 #define I915_SW_FENCE_BUG_ON(expr) BUILD_BUG_ON_INVALID(expr)
 #endif
 
-#define I915_SW_FENCE_FLAG_ALLOC BIT(3) /* after WQ_FLAG_* for safety */
-
 static DEFINE_SPINLOCK(i915_sw_fence_lock);
+
+#define WQ_FLAG_BITS \
+	BITS_PER_TYPE(typeof_member(struct wait_queue_entry, flags))
+
+/* after WQ_FLAG_* for safety */
+#define I915_SW_FENCE_FLAG_FENCE BIT(WQ_FLAG_BITS - 1)
+#define I915_SW_FENCE_FLAG_ALLOC BIT(WQ_FLAG_BITS - 2)
 
 enum {
 	DEBUG_FENCE_IDLE = 0,
@@ -34,7 +39,7 @@ static void *i915_sw_fence_debug_hint(void *addr)
 
 #ifdef CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS
 
-static struct debug_obj_descr i915_sw_fence_debug_descr = {
+static const struct debug_obj_descr i915_sw_fence_debug_descr = {
 	.name = "i915_sw_fence",
 	.debug_hint = i915_sw_fence_debug_hint,
 };
@@ -154,19 +159,23 @@ static void __i915_sw_fence_wake_up_all(struct i915_sw_fence *fence,
 	spin_lock_irqsave_nested(&x->lock, flags, 1 + !!continuation);
 	if (continuation) {
 		list_for_each_entry_safe(pos, next, &x->head, entry) {
-			if (pos->func == autoremove_wake_function)
-				pos->func(pos, TASK_NORMAL, 0, continuation);
-			else
+			if (pos->flags & I915_SW_FENCE_FLAG_FENCE)
 				list_move_tail(&pos->entry, continuation);
+			else
+				pos->func(pos, TASK_NORMAL, 0, continuation);
 		}
 	} else {
 		LIST_HEAD(extra);
 
 		do {
 			list_for_each_entry_safe(pos, next, &x->head, entry) {
-				pos->func(pos,
-					  TASK_NORMAL, fence->error,
-					  &extra);
+				int wake_flags;
+
+				wake_flags = 0;
+				if (pos->flags & I915_SW_FENCE_FLAG_FENCE)
+					wake_flags = fence->error;
+
+				pos->func(pos, TASK_NORMAL, wake_flags, &extra);
 			}
 
 			if (list_empty(&extra))
@@ -328,8 +337,8 @@ static int __i915_sw_fence_await_sw_fence(struct i915_sw_fence *fence,
 					  struct i915_sw_fence *signaler,
 					  wait_queue_entry_t *wq, gfp_t gfp)
 {
+	unsigned int pending;
 	unsigned long flags;
-	int pending;
 
 	debug_fence_assert(fence);
 	might_sleep_if(gfpflags_allow_blocking(gfp));
@@ -345,7 +354,7 @@ static int __i915_sw_fence_await_sw_fence(struct i915_sw_fence *fence,
 	if (unlikely(i915_sw_fence_check_if_after(fence, signaler)))
 		return -EINVAL;
 
-	pending = 0;
+	pending = I915_SW_FENCE_FLAG_FENCE;
 	if (!wq) {
 		wq = kmalloc(sizeof(*wq), gfp);
 		if (!wq) {
@@ -421,7 +430,7 @@ static void timer_i915_sw_fence_wake(struct timer_list *t)
 	if (!fence)
 		return;
 
-	pr_notice("Asynchronous wait on fence %s:%s:%llx timed out (hint:%pS)\n",
+	pr_notice("Asynchronous wait on fence %s:%s:%llx timed out (hint:%ps)\n",
 		  cb->dma->ops->get_driver_name(cb->dma),
 		  cb->dma->ops->get_timeline_name(cb->dma),
 		  cb->dma->seqno,
@@ -546,13 +555,11 @@ int __i915_sw_fence_await_dma_fence(struct i915_sw_fence *fence,
 	cb->fence = fence;
 	i915_sw_fence_await(fence);
 
-	ret = dma_fence_add_callback(dma, &cb->base, __dma_i915_sw_fence_wake);
-	if (ret == 0) {
-		ret = 1;
-	} else {
+	ret = 1;
+	if (dma_fence_add_callback(dma, &cb->base, __dma_i915_sw_fence_wake)) {
+		/* fence already signaled */
 		__dma_i915_sw_fence_wake(dma, &cb->base);
-		if (ret == -ENOENT) /* fence already signaled */
-			ret = 0;
+		ret = 0;
 	}
 
 	return ret;
@@ -575,7 +582,7 @@ int i915_sw_fence_await_reservation(struct i915_sw_fence *fence,
 		struct dma_fence **shared;
 		unsigned int count, i;
 
-		ret = dma_resv_get_fences_rcu(resv, &excl, &count, &shared);
+		ret = dma_resv_get_fences(resv, &excl, &count, &shared);
 		if (ret)
 			return ret;
 
@@ -599,7 +606,7 @@ int i915_sw_fence_await_reservation(struct i915_sw_fence *fence,
 			dma_fence_put(shared[i]);
 		kfree(shared);
 	} else {
-		excl = dma_resv_get_excl_rcu(resv);
+		excl = dma_resv_get_excl_unlocked(resv);
 	}
 
 	if (ret >= 0 && excl && excl->ops != exclude) {

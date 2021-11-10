@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: MIT
  *
- * Copyright � 2008-2018 Intel Corporation
+ * Copyright © 2008-2018 Intel Corporation
  */
 
 #ifndef _I915_GPU_ERROR_H_
@@ -15,6 +15,7 @@
 #include <drm/drm_mm.h>
 
 #include "gt/intel_engine.h"
+#include "gt/intel_gt_types.h"
 #include "gt/uc/intel_uc_fw.h"
 
 #include "intel_device_info.h"
@@ -28,7 +29,6 @@ struct drm_i915_private;
 struct i915_vma_compress;
 struct intel_engine_capture_vma;
 struct intel_overlay_error_state;
-struct intel_display_error_state;
 
 struct i915_vma_coredump {
 	struct i915_vma_coredump *next;
@@ -42,7 +42,7 @@ struct i915_vma_coredump {
 	int num_pages;
 	int page_count;
 	int unused;
-	u32 *pages[0];
+	u32 *pages[];
 };
 
 struct i915_request_coredump {
@@ -50,7 +50,6 @@ struct i915_request_coredump {
 	pid_t pid;
 	u32 context;
 	u32 seqno;
-	u32 start;
 	u32 head;
 	u32 tail;
 	struct i915_sched_attr sched_attr;
@@ -59,6 +58,7 @@ struct i915_request_coredump {
 struct intel_engine_coredump {
 	const struct intel_engine_cs *engine;
 
+	bool hung;
 	bool simulated;
 	u32 reset_count;
 
@@ -118,6 +118,8 @@ struct intel_gt_coredump {
 	const struct intel_gt *_gt;
 	bool awake;
 	bool simulated;
+
+	struct intel_gt_info info;
 
 	/* Generic register state */
 	u32 eir;
@@ -179,7 +181,6 @@ struct i915_gpu_coredump {
 	struct i915_params params;
 
 	struct intel_overlay_error_state *overlay;
-	struct intel_display_error_state *display;
 
 	struct scatterlist *sgl, *fit;
 };
@@ -216,8 +217,10 @@ struct drm_i915_error_state_buf {
 __printf(2, 3)
 void i915_error_printf(struct drm_i915_error_state_buf *e, const char *f, ...);
 
-struct i915_gpu_coredump *i915_gpu_coredump(struct drm_i915_private *i915);
-void i915_capture_error_state(struct drm_i915_private *i915);
+struct i915_gpu_coredump *i915_gpu_coredump(struct intel_gt *gt,
+					    intel_engine_mask_t engine_mask);
+void i915_capture_error_state(struct intel_gt *gt,
+			      intel_engine_mask_t engine_mask);
 
 struct i915_gpu_coredump *
 i915_gpu_coredump_alloc(struct drm_i915_private *i915, gfp_t gfp);
@@ -269,7 +272,8 @@ void i915_disable_error_state(struct drm_i915_private *i915, int err);
 
 #else
 
-static inline void i915_capture_error_state(struct drm_i915_private *i915)
+static inline void
+i915_capture_error_state(struct intel_gt *gt, intel_engine_mask_t engine_mask)
 {
 }
 

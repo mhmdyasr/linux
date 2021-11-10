@@ -3,14 +3,16 @@
 #define _ASM_X86_EFI_H
 
 #include <asm/fpu/api.h>
-#include <asm/pgtable.h>
 #include <asm/processor-flags.h>
 #include <asm/tlb.h>
 #include <asm/nospec-branch.h>
 #include <asm/mmu_context.h>
 #include <linux/build_bug.h>
+#include <linux/kernel.h>
+#include <linux/pgtable.h>
 
 extern unsigned long efi_fw_vendor, efi_config_table;
+extern unsigned long efi_mixed_mode_stack_pa;
 
 /*
  * We map the EFI regions needed for runtime services non-contiguously,
@@ -21,17 +23,7 @@ extern unsigned long efi_fw_vendor, efi_config_table;
  *
  * This is the main reason why we're doing stable VA mappings for RT
  * services.
- *
- * SGI UV1 machines are known to be incompatible with this scheme, so we
- * provide an opt-out for these machines via a DMI quirk that sets the
- * attribute below.
  */
-#define EFI_UV1_MEMMAP         EFI_ARCH_1
-
-static inline bool efi_have_uv1_memmap(void)
-{
-	return IS_ENABLED(CONFIG_X86_UV) && efi_enabled(EFI_UV1_MEMMAP);
-}
 
 #define EFI32_LOADER_SIGNATURE	"EL32"
 #define EFI64_LOADER_SIGNATURE	"EL64"
@@ -77,23 +69,36 @@ static inline bool efi_have_uv1_memmap(void)
 		#f " called with too many arguments (" #p ">" #n ")");	\
 })
 
+static inline void efi_fpu_begin(void)
+{
+	/*
+	 * The UEFI calling convention (UEFI spec 2.3.2 and 2.3.4) requires
+	 * that FCW and MXCSR (64-bit) must be initialized prior to calling
+	 * UEFI code.  (Oddly the spec does not require that the FPU stack
+	 * be empty.)
+	 */
+	kernel_fpu_begin_mask(KFPU_387 | KFPU_MXCSR);
+}
+
+static inline void efi_fpu_end(void)
+{
+	kernel_fpu_end();
+}
+
 #ifdef CONFIG_X86_32
 #define arch_efi_call_virt_setup()					\
 ({									\
-	kernel_fpu_begin();						\
+	efi_fpu_begin();						\
 	firmware_restrict_branch_speculation_start();			\
 })
 
 #define arch_efi_call_virt_teardown()					\
 ({									\
 	firmware_restrict_branch_speculation_end();			\
-	kernel_fpu_end();						\
+	efi_fpu_end();							\
 })
 
-
 #define arch_efi_call_virt(p, f, args...)	p->f(args)
-
-#define efi_ioremap(addr, size, type, attr)	ioremap_cache(addr, size)
 
 #else /* !CONFIG_X86_32 */
 
@@ -106,24 +111,12 @@ extern asmlinkage u64 __efi_call(void *fp, ...);
 	__efi_call(__VA_ARGS__);					\
 })
 
-/*
- * struct efi_scratch - Scratch space used while switching to/from efi_mm
- * @phys_stack: stack used during EFI Mixed Mode
- * @prev_mm:    store/restore stolen mm_struct while switching to/from efi_mm
- */
-struct efi_scratch {
-	u64			phys_stack;
-	struct mm_struct	*prev_mm;
-} __packed;
-
 #define arch_efi_call_virt_setup()					\
 ({									\
 	efi_sync_low_kernel_mappings();					\
-	kernel_fpu_begin();						\
+	efi_fpu_begin();						\
 	firmware_restrict_branch_speculation_start();			\
-									\
-	if (!efi_have_uv1_memmap())					\
-		efi_switch_mm(&efi_mm);					\
+	efi_enter_mm();							\
 })
 
 #define arch_efi_call_virt(p, f, args...)				\
@@ -131,15 +124,10 @@ struct efi_scratch {
 
 #define arch_efi_call_virt_teardown()					\
 ({									\
-	if (!efi_have_uv1_memmap())					\
-		efi_switch_mm(efi_scratch.prev_mm);			\
-									\
+	efi_leave_mm();							\
 	firmware_restrict_branch_speculation_end();			\
-	kernel_fpu_end();						\
+	efi_fpu_end();							\
 })
-
-extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
-					u32 type, u64 attribute);
 
 #ifdef CONFIG_KASAN
 /*
@@ -155,28 +143,23 @@ extern void __iomem *__init efi_ioremap(unsigned long addr, unsigned long size,
 
 #endif /* CONFIG_X86_32 */
 
-extern struct efi_scratch efi_scratch;
-extern void __init efi_set_executable(efi_memory_desc_t *md, bool executable);
 extern int __init efi_memblock_x86_reserve_range(void);
 extern void __init efi_print_memmap(void);
-extern void __init efi_memory_uc(u64 addr, unsigned long size);
 extern void __init efi_map_region(efi_memory_desc_t *md);
 extern void __init efi_map_region_fixed(efi_memory_desc_t *md);
 extern void efi_sync_low_kernel_mappings(void);
 extern int __init efi_alloc_page_tables(void);
 extern int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages);
-extern void __init old_map_region(efi_memory_desc_t *md);
-extern void __init runtime_code_page_mkexec(void);
 extern void __init efi_runtime_update_mappings(void);
 extern void __init efi_dump_pagetable(void);
 extern void __init efi_apply_memmap_quirks(void);
 extern int __init efi_reuse_config(u64 tables, int nr_tables);
 extern void efi_delete_dummy_variable(void);
-extern void efi_switch_mm(struct mm_struct *mm);
-extern void efi_recover_from_page_fault(unsigned long phys_addr);
+extern void efi_crash_gracefully_on_page_fault(unsigned long phys_addr);
 extern void efi_free_boot_services(void);
-extern pgd_t * __init efi_uv1_memmap_phys_prolog(void);
-extern void __init efi_uv1_memmap_phys_epilog(pgd_t *save_pgd);
+
+void efi_enter_mm(void);
+void efi_leave_mm(void);
 
 /* kexec external ABI */
 struct efi_setup_data {
@@ -225,14 +208,19 @@ efi_status_t efi_set_virtual_address_map(unsigned long memory_map_size,
 
 /* arch specific definitions used by the stub code */
 
-__attribute_const__ bool efi_is_64bit(void);
+#ifdef CONFIG_EFI_MIXED
+
+#define ARCH_HAS_EFISTUB_WRAPPERS
+
+static inline bool efi_is_64bit(void)
+{
+	extern const bool efi_is64;
+
+	return efi_is64;
+}
 
 static inline bool efi_is_native(void)
 {
-	if (!IS_ENABLED(CONFIG_X86_64))
-		return true;
-	if (!IS_ENABLED(CONFIG_EFI_MIXED))
-		return true;
 	return efi_is_64bit();
 }
 
@@ -286,6 +274,15 @@ static inline u32 efi64_convert_status(efi_status_t status)
 #define __efi64_argmap_allocate_pool(type, size, buffer)		\
 	((type), (size), efi64_zero_upper(buffer))
 
+#define __efi64_argmap_create_event(type, tpl, f, c, event)		\
+	((type), (tpl), (f), (c), efi64_zero_upper(event))
+
+#define __efi64_argmap_set_timer(event, type, time)			\
+	((event), (type), lower_32_bits(time), upper_32_bits(time))
+
+#define __efi64_argmap_wait_for_event(num, event, index)		\
+	((num), (event), efi64_zero_upper(index))
+
 #define __efi64_argmap_handle_protocol(handle, protocol, interface)	\
 	((handle), (protocol), efi64_zero_upper(interface))
 
@@ -306,6 +303,10 @@ static inline u32 efi64_convert_status(efi_status_t status)
 /* LoadFile */
 #define __efi64_argmap_load_file(protocol, path, policy, bufsize, buf)	\
 	((protocol), (path), (policy), efi64_zero_upper(bufsize), (buf))
+
+/* Graphics Output Protocol */
+#define __efi64_argmap_query_mode(gop, mode, size, info)		\
+	((gop), (mode), efi64_zero_upper(size), efi64_zero_upper(info))
 
 /*
  * The macros below handle the plumbing for the argument mapping. To add a
@@ -335,15 +336,26 @@ static inline u32 efi64_convert_status(efi_status_t status)
 
 #define efi_bs_call(func, ...)						\
 	(efi_is_native()						\
-		? efi_system_table()->boottime->func(__VA_ARGS__)	\
-		: __efi64_thunk_map(efi_table_attr(efi_system_table(),	\
-				boottime), func, __VA_ARGS__))
+		? efi_system_table->boottime->func(__VA_ARGS__)		\
+		: __efi64_thunk_map(efi_table_attr(efi_system_table,	\
+						   boottime),		\
+				    func, __VA_ARGS__))
 
 #define efi_rt_call(func, ...)						\
 	(efi_is_native()						\
-		? efi_system_table()->runtime->func(__VA_ARGS__)	\
-		: __efi64_thunk_map(efi_table_attr(efi_system_table(),	\
-				runtime), func, __VA_ARGS__))
+		? efi_system_table->runtime->func(__VA_ARGS__)		\
+		: __efi64_thunk_map(efi_table_attr(efi_system_table,	\
+						   runtime),		\
+				    func, __VA_ARGS__))
+
+#else /* CONFIG_EFI_MIXED */
+
+static inline bool efi_is_64bit(void)
+{
+	return IS_ENABLED(CONFIG_X86_64);
+}
+
+#endif /* CONFIG_EFI_MIXED */
 
 extern bool efi_reboot_required(void);
 extern bool efi_is_table_address(unsigned long phys_addr);
@@ -375,5 +387,8 @@ static inline void efi_fake_memmap_early(void)
 {
 }
 #endif
+
+#define arch_ima_efi_boot_mode	\
+	({ extern struct boot_params boot_params; boot_params.secure_boot; })
 
 #endif /* _ASM_X86_EFI_H */

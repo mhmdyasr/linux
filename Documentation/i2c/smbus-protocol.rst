@@ -27,8 +27,8 @@ a different protocol operation entirely.
 Each transaction type corresponds to a functionality flag. Before calling a
 transaction function, a device driver should always check (just once) for
 the corresponding functionality flag to ensure that the underlying I2C
-adapter supports the transaction in question. See :doc:`functionality` for
-the details.
+adapter supports the transaction in question. See
+Documentation/i2c/functionality.rst for the details.
 
 
 Key to symbols
@@ -57,7 +57,7 @@ SMBus Quick Command
 
 This sends a single bit to the device, at the place of the Rd/Wr bit::
 
-  A Addr Rd/Wr [A] P
+  S Addr Rd/Wr [A] P
 
 Functionality flag: I2C_FUNC_SMBUS_QUICK
 

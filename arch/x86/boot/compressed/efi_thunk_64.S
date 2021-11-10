@@ -5,9 +5,8 @@
  * Early support for invoking 32-bit EFI services from a 64-bit kernel.
  *
  * Because this thunking occurs before ExitBootServices() we have to
- * restore the firmware's 32-bit GDT before we make EFI serivce calls,
- * since the firmware's 32-bit IDT is still currently installed and it
- * needs to be able to service interrupts.
+ * restore the firmware's 32-bit GDT and IDT before we make EFI service
+ * calls.
  *
  * On the plus side, we don't have to worry about mangling 64-bit
  * addresses into 32-bits because we're executing with an identity
@@ -28,8 +27,6 @@ SYM_FUNC_START(__efi64_thunk)
 	push	%rbx
 
 	leaq	1f(%rip), %rbp
-	leaq	efi_gdt64(%rip), %rbx
-	movl	%ebx, 2(%rbx)		/* Fixup the gdt base address */
 
 	movl	%ds, %eax
 	push	%rax
@@ -41,23 +38,29 @@ SYM_FUNC_START(__efi64_thunk)
 	/*
 	 * Convert x86-64 ABI params to i386 ABI
 	 */
-	subq	$32, %rsp
+	subq	$64, %rsp
 	movl	%esi, 0x0(%rsp)
 	movl	%edx, 0x4(%rsp)
 	movl	%ecx, 0x8(%rsp)
 	movl	%r8d, 0xc(%rsp)
 	movl	%r9d, 0x10(%rsp)
 
-	sgdt	0x14(%rsp)
+	leaq	0x14(%rsp), %rbx
+	sgdt	(%rbx)
+
+	addq	$16, %rbx
+	sidt	(%rbx)
 
 	/*
-	 * Switch to gdt with 32-bit segments. This is the firmware GDT
-	 * that was installed when the kernel started executing. This
-	 * pointer was saved at the EFI stub entry point in head_64.S.
+	 * Switch to IDT and GDT with 32-bit segments. This is the firmware GDT
+	 * and IDT that was installed when the kernel started executing. The
+	 * pointers were saved at the EFI stub entry point in head_64.S.
 	 *
 	 * Pass the saved DS selector to the 32-bit code, and use far return to
 	 * restore the saved CS selector.
 	 */
+	leaq	efi32_boot_idt(%rip), %rax
+	lidt	(%rax)
 	leaq	efi32_boot_gdt(%rip), %rax
 	lgdt	(%rax)
 
@@ -68,8 +71,7 @@ SYM_FUNC_START(__efi64_thunk)
 	pushq	%rax
 	lretq
 
-1:	lgdt	0x14(%rsp)
-	addq	$32, %rsp
+1:	addq	$64, %rsp
 	movq	%rdi, %rax
 
 	pop	%rbx
@@ -130,9 +132,12 @@ SYM_FUNC_START_LOCAL(efi_enter32)
 
 	/*
 	 * Some firmware will return with interrupts enabled. Be sure to
-	 * disable them before we switch GDTs.
+	 * disable them before we switch GDTs and IDTs.
 	 */
 	cli
+
+	lidtl	(%ebx)
+	subl	$16, %ebx
 
 	lgdtl	(%ebx)
 
@@ -168,6 +173,11 @@ SYM_DATA_START(efi32_boot_gdt)
 	.quad	0
 SYM_DATA_END(efi32_boot_gdt)
 
+SYM_DATA_START(efi32_boot_idt)
+	.word	0
+	.quad	0
+SYM_DATA_END(efi32_boot_idt)
+
 SYM_DATA_START(efi32_boot_cs)
 	.word	0
 SYM_DATA_END(efi32_boot_cs)
@@ -175,14 +185,3 @@ SYM_DATA_END(efi32_boot_cs)
 SYM_DATA_START(efi32_boot_ds)
 	.word	0
 SYM_DATA_END(efi32_boot_ds)
-
-SYM_DATA_START(efi_gdt64)
-	.word	efi_gdt64_end - efi_gdt64
-	.long	0			/* Filled out by user */
-	.word	0
-	.quad	0x0000000000000000	/* NULL descriptor */
-	.quad	0x00af9a000000ffff	/* __KERNEL_CS */
-	.quad	0x00cf92000000ffff	/* __KERNEL_DS */
-	.quad	0x0080890000000000	/* TS descriptor */
-	.quad   0x0000000000000000	/* TS continued */
-SYM_DATA_END_LABEL(efi_gdt64, SYM_L_LOCAL, efi_gdt64_end)

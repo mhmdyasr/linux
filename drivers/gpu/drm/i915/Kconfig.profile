@@ -1,3 +1,29 @@
+config DRM_I915_REQUEST_TIMEOUT
+	int "Default timeout for requests (ms)"
+	default 20000 # milliseconds
+	help
+	  Configures the default timeout after which any user submissions will
+	  be forcefully terminated.
+
+	  Beware setting this value lower, or close to heartbeat interval
+	  rounded to whole seconds times three, in order to avoid allowing
+	  misbehaving applications causing total rendering failure in unrelated
+	  clients.
+
+	  May be 0 to disable the timeout.
+
+config DRM_I915_FENCE_TIMEOUT
+	int "Timeout for unsignaled foreign fences (ms, jiffy granularity)"
+	default 10000 # milliseconds
+	help
+	  When listening to a foreign fence, we install a supplementary timer
+	  to ensure that we are always signaled and our userspace is able to
+	  make forward progress. This value specifies the timeout used for an
+	  unsignaled foreign fence.
+
+	  May be 0 to disable the timeout, and rely on the foreign fence being
+	  eventually signaled.
+
 config DRM_I915_USERFAULT_AUTOSUSPEND
 	int "Runtime autosuspend delay for userspace GGTT mmaps (ms)"
 	default 250 # milliseconds

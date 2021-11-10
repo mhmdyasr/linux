@@ -14,12 +14,12 @@
 
 SYM_CODE_START(efi_enter_kernel)
 	/*
-	 * efi_entry() will have copied the kernel image if necessary and we
+	 * efi_pe_entry() will have copied the kernel image if necessary and we
 	 * end up here with device tree address in x1 and the kernel entry
 	 * point stored in x0. Save those values in registers which are
 	 * callee preserved.
 	 */
-	ldr	w2, =stext_offset
+	ldr	w2, =primary_entry_offset
 	add	x19, x0, x2		// relocated Image entrypoint
 	mov	x20, x1			// DTB address
 
@@ -28,7 +28,8 @@ SYM_CODE_START(efi_enter_kernel)
 	 * stale icache entries from before relocation.
 	 */
 	ldr	w1, =kernel_size
-	bl	__clean_dcache_area_poc
+	add	x1, x0, x1
+	bl	dcache_clean_poc
 	ic	ialluis
 
 	/*
@@ -36,8 +37,8 @@ SYM_CODE_START(efi_enter_kernel)
 	 * so that we can safely disable the MMU and caches.
 	 */
 	adr	x0, 0f
-	ldr	w1, 3f
-	bl	__clean_dcache_area_poc
+	adr	x1, 3f
+	bl	dcache_clean_poc
 0:
 	/* Turn off Dcache and MMU */
 	mrs	x0, CurrentEL
@@ -64,5 +65,5 @@ SYM_CODE_START(efi_enter_kernel)
 	mov	x2, xzr
 	mov	x3, xzr
 	br	x19
+3:
 SYM_CODE_END(efi_enter_kernel)
-3:	.long	. - 0b

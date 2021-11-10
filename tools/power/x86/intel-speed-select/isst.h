@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 
 #define BIT(x) (1 << (x))
+#define BIT_ULL(nr) (1ULL << (nr))
 #define GENMASK(h, l) (((~0UL) << (l)) & (~0UL >> (sizeof(long) * 8 - 1 - (h))))
 #define GENMASK_ULL(h, l)                                                      \
 	(((~0ULL) << (l)) & (~0ULL >> (sizeof(long long) * 8 - 1 - (h))))
@@ -169,7 +170,7 @@ struct isst_pkg_ctdp {
 
 extern int get_topo_max_cpus(void);
 extern int get_cpu_count(int pkg_id, int die_id);
-extern int get_core_count(int pkg_id, int die_id);
+extern int get_max_punit_core_id(int pkg_id, int die_id);
 
 /* Common interfaces */
 FILE *get_output_file(void);
@@ -227,6 +228,7 @@ extern void isst_fact_display_information(int cpu, FILE *outf, int level,
 					  int fact_bucket, int fact_avx,
 					  struct isst_fact_info *fact_info);
 extern int isst_set_trl(int cpu, unsigned long long trl);
+extern int isst_get_trl(int cpu, unsigned long long *trl);
 extern int isst_set_trl_from_current_tdp(int cpu, unsigned long long trl);
 extern int isst_get_config_tdp_lock_status(int cpu);
 
@@ -254,4 +256,8 @@ extern int is_clx_n_platform(void);
 extern int get_cpufreq_base_freq(int cpu);
 extern int isst_read_pm_config(int cpu, int *cp_state, int *cp_cap);
 extern void isst_display_error_info_message(int error, char *msg, int arg_valid, int arg);
+extern int is_skx_based_platform(void);
+extern int is_spr_platform(void);
+extern int is_icx_platform(void);
+extern void isst_trl_display_information(int cpu, FILE *outf, unsigned long long trl);
 #endif

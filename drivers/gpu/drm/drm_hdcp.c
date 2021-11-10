@@ -241,8 +241,12 @@ static int drm_hdcp_request_srm(struct drm_device *drm_dev,
 
 	ret = request_firmware_direct(&fw, (const char *)fw_name,
 				      drm_dev->dev);
-	if (ret < 0)
+	if (ret < 0) {
+		*revoked_ksv_cnt = 0;
+		*revoked_ksv_list = NULL;
+		ret = 0;
 		goto exit;
+	}
 
 	if (fw->size && fw->data)
 		ret = drm_hdcp_srm_update(fw->data, fw->size, revoked_ksv_list,
@@ -276,7 +280,7 @@ exit:
  * https://www.digital-cp.com/sites/default/files/specifications/HDCP%20on%20HDMI%20Specification%20Rev2_2_Final1.pdf
  *
  * Returns:
- * Count of the revoked KSVs or -ve error number incase of the failure.
+ * Count of the revoked KSVs or -ve error number in case of the failure.
  */
 int drm_hdcp_check_ksvs_revoked(struct drm_device *drm_dev, u8 *ksvs,
 				u32 ksv_count)
@@ -287,6 +291,8 @@ int drm_hdcp_check_ksvs_revoked(struct drm_device *drm_dev, u8 *ksvs,
 
 	ret = drm_hdcp_request_srm(drm_dev, &revoked_ksv_list,
 				   &revoked_ksv_cnt);
+	if (ret)
+		return ret;
 
 	/* revoked_ksv_cnt will be zero when above function failed */
 	for (i = 0; i < revoked_ksv_cnt; i++)

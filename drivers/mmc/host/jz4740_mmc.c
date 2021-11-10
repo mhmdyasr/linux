@@ -108,6 +108,7 @@
 #define	JZ_MMC_LPM_LOW_POWER_MODE_EN BIT(0)
 
 #define JZ_MMC_CLK_RATE 24000000
+#define JZ_MMC_REQ_TIMEOUT_MS 5000
 
 enum jz4740_mmc_version {
 	JZ_MMC_JZ4740,
@@ -151,7 +152,6 @@ struct jz4740_mmc_host {
 	enum jz4740_mmc_version version;
 
 	int irq;
-	int card_detect_irq;
 
 	void __iomem *base;
 	struct resource *mem_res;
@@ -440,7 +440,8 @@ static unsigned int jz4740_mmc_poll_irq(struct jz4740_mmc_host *host,
 
 	if (timeout == 0) {
 		set_bit(0, &host->waiting);
-		mod_timer(&host->timeout_timer, jiffies + 5*HZ);
+		mod_timer(&host->timeout_timer,
+			  jiffies + msecs_to_jiffies(JZ_MMC_REQ_TIMEOUT_MS));
 		jz4740_mmc_set_irq_enabled(host, irq, true);
 		return true;
 	}
@@ -577,10 +578,6 @@ static bool jz4740_mmc_read_data(struct jz4740_mmc_host *host,
 			}
 		}
 		data->bytes_xfered += miter->length;
-
-		/* This can go away once MIPS implements
-		 * flush_kernel_dcache_page */
-		flush_dcache_page(miter->page);
 	}
 	sg_miter_stop(miter);
 
@@ -673,7 +670,7 @@ static void jz4740_mmc_send_command(struct jz4740_mmc_host *host,
 			cmdat |= JZ_MMC_CMDAT_WRITE;
 		if (host->use_dma) {
 			/*
-			 * The 4780's MMC controller has integrated DMA ability
+			 * The JZ4780's MMC controller has integrated DMA ability
 			 * in addition to being able to use the external DMA
 			 * controller. It moves DMA control bits to a separate
 			 * register. The DMA_SEL bit chooses the external
@@ -737,7 +734,7 @@ static irqreturn_t jz_mmc_irq_worker(int irq, void *devid)
 			break;
 
 		jz_mmc_prepare_data_transfer(host);
-		/* fall through */
+		fallthrough;
 
 	case JZ4740_MMC_STATE_TRANSFER_DATA:
 		if (host->use_dma) {
@@ -772,7 +769,7 @@ static irqreturn_t jz_mmc_irq_worker(int irq, void *devid)
 			break;
 		}
 		jz4740_mmc_write_irq_reg(host, JZ_MMC_IRQ_DATA_TRAN_DONE);
-		/* fall through */
+		fallthrough;
 
 	case JZ4740_MMC_STATE_SEND_STOP:
 		if (!req->stop)
@@ -788,6 +785,8 @@ static irqreturn_t jz_mmc_irq_worker(int irq, void *devid)
 				break;
 			}
 		}
+		fallthrough;
+
 	case JZ4740_MMC_STATE_DONE:
 		break;
 	}
@@ -865,7 +864,7 @@ static int jz4740_mmc_set_clock_rate(struct jz4740_mmc_host *host, int rate)
 	writew(div, host->base + JZ_REG_MMC_CLKRT);
 
 	if (real_rate > 25000000) {
-		if (host->version >= JZ_MMC_X1000) {
+		if (host->version >= JZ_MMC_JZ4780) {
 			writel(JZ_MMC_LPM_DRV_RISING_QTR_PHASE_DLY |
 				   JZ_MMC_LPM_SMP_RISING_QTR_OR_HALF_PHASE_DLY |
 				   JZ_MMC_LPM_LOW_POWER_MODE_EN,
@@ -893,7 +892,8 @@ static void jz4740_mmc_request(struct mmc_host *mmc, struct mmc_request *req)
 
 	host->state = JZ4740_MMC_STATE_READ_RESPONSE;
 	set_bit(0, &host->waiting);
-	mod_timer(&host->timeout_timer, jiffies + 5*HZ);
+	mod_timer(&host->timeout_timer,
+		  jiffies + msecs_to_jiffies(JZ_MMC_REQ_TIMEOUT_MS));
 	jz4740_mmc_send_command(host, req->cmd);
 }
 
@@ -957,6 +957,7 @@ static const struct of_device_id jz4740_mmc_of_match[] = {
 	{ .compatible = "ingenic,jz4740-mmc", .data = (void *) JZ_MMC_JZ4740 },
 	{ .compatible = "ingenic,jz4725b-mmc", .data = (void *)JZ_MMC_JZ4725B },
 	{ .compatible = "ingenic,jz4760-mmc", .data = (void *) JZ_MMC_JZ4760 },
+	{ .compatible = "ingenic,jz4775-mmc", .data = (void *) JZ_MMC_JZ4780 },
 	{ .compatible = "ingenic,jz4780-mmc", .data = (void *) JZ_MMC_JZ4780 },
 	{ .compatible = "ingenic,x1000-mmc", .data = (void *) JZ_MMC_X1000 },
 	{},
@@ -988,9 +989,7 @@ static int jz4740_mmc_probe(struct platform_device* pdev)
 
 	ret = mmc_of_parse(mmc);
 	if (ret) {
-		if (ret != -EPROBE_DEFER)
-			dev_err(&pdev->dev,
-				"could not parse device properties: %d\n", ret);
+		dev_err_probe(&pdev->dev, ret, "could not parse device properties\n");
 		goto err_free_host;
 	}
 
@@ -1013,7 +1012,6 @@ static int jz4740_mmc_probe(struct platform_device* pdev)
 	host->base = devm_ioremap_resource(&pdev->dev, host->mem_res);
 	if (IS_ERR(host->base)) {
 		ret = PTR_ERR(host->base);
-		dev_err(&pdev->dev, "Failed to ioremap base memory\n");
 		goto err_free_host;
 	}
 
@@ -1022,6 +1020,12 @@ static int jz4740_mmc_probe(struct platform_device* pdev)
 		mmc->f_max = JZ_MMC_CLK_RATE;
 	mmc->f_min = mmc->f_max / 128;
 	mmc->ocr_avail = MMC_VDD_32_33 | MMC_VDD_33_34;
+
+	/*
+	 * We use a fixed timeout of 5s, hence inform the core about it. A
+	 * future improvement should instead respect the cmd->busy_timeout.
+	 */
+	mmc->max_busy_timeout = JZ_MMC_REQ_TIMEOUT_MS;
 
 	mmc->max_blk_size = (1 << 10) - 1;
 	mmc->max_blk_count = (1 << 15) - 1;
@@ -1099,32 +1103,27 @@ static int jz4740_mmc_remove(struct platform_device *pdev)
 	return 0;
 }
 
-#ifdef CONFIG_PM_SLEEP
-
-static int jz4740_mmc_suspend(struct device *dev)
+static int __maybe_unused jz4740_mmc_suspend(struct device *dev)
 {
 	return pinctrl_pm_select_sleep_state(dev);
 }
 
-static int jz4740_mmc_resume(struct device *dev)
+static int __maybe_unused jz4740_mmc_resume(struct device *dev)
 {
 	return pinctrl_select_default_state(dev);
 }
 
 static SIMPLE_DEV_PM_OPS(jz4740_mmc_pm_ops, jz4740_mmc_suspend,
 	jz4740_mmc_resume);
-#define JZ4740_MMC_PM_OPS (&jz4740_mmc_pm_ops)
-#else
-#define JZ4740_MMC_PM_OPS NULL
-#endif
 
 static struct platform_driver jz4740_mmc_driver = {
 	.probe = jz4740_mmc_probe,
 	.remove = jz4740_mmc_remove,
 	.driver = {
 		.name = "jz4740-mmc",
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 		.of_match_table = of_match_ptr(jz4740_mmc_of_match),
-		.pm = JZ4740_MMC_PM_OPS,
+		.pm = pm_ptr(&jz4740_mmc_pm_ops),
 	},
 };
 

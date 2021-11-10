@@ -36,8 +36,9 @@
 /**
  * struct clk_icst - ICST VCO clock wrapper
  * @hw: corresponding clock hardware entry
- * @vcoreg: VCO register address
- * @lockreg: VCO lock register address
+ * @map: register map
+ * @vcoreg_off: VCO register address
+ * @lockreg_off: VCO lock register address
  * @params: parameters for this ICST instance
  * @rate: current rate
  * @ctype: the type of control register for the ICST
@@ -428,7 +429,7 @@ static const struct icst_params icst307_params = {
 	.idx2s		= icst307_idx2s,
 };
 
-/**
+/*
  * The core modules on the Integrator/AP and Integrator/CP have
  * especially crippled ICST525 control.
  */
@@ -500,7 +501,8 @@ static void __init of_syscon_icst_setup(struct device_node *np)
 		return;
 	}
 
-	if (of_property_read_u32(np, "vco-offset", &icst_desc.vco_offset)) {
+	if (of_property_read_u32(np, "reg", &icst_desc.vco_offset) &&
+	    of_property_read_u32(np, "vco-offset", &icst_desc.vco_offset)) {
 		pr_err("no VCO register offset for ICST clock\n");
 		return;
 	}

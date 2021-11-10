@@ -19,8 +19,30 @@
 #define ICE_PKG_CNT 4
 
 enum ice_status
+ice_acquire_change_lock(struct ice_hw *hw, enum ice_aq_res_access_type access);
+void ice_release_change_lock(struct ice_hw *hw);
+enum ice_status
+ice_find_prot_off(struct ice_hw *hw, enum ice_block blk, u8 prof, u16 fv_idx,
+		  u8 *prot, u16 *off);
+void
+ice_get_sw_fv_bitmap(struct ice_hw *hw, enum ice_prof_type type,
+		     unsigned long *bm);
+void
+ice_init_prof_result_bm(struct ice_hw *hw);
+enum ice_status
+ice_get_sw_fv_list(struct ice_hw *hw, u8 *prot_ids, u16 ids_cnt,
+		   unsigned long *bm, struct list_head *fv_list);
+bool
+ice_get_open_tunnel_port(struct ice_hw *hw, u16 *port);
+int ice_udp_tunnel_set_port(struct net_device *netdev, unsigned int table,
+			    unsigned int idx, struct udp_tunnel_info *ti);
+int ice_udp_tunnel_unset_port(struct net_device *netdev, unsigned int table,
+			      unsigned int idx, struct udp_tunnel_info *ti);
+
+enum ice_status
 ice_add_prof(struct ice_hw *hw, enum ice_block blk, u64 id, u8 ptypes[],
-	     struct ice_fv_word *es);
+	     const struct ice_ptype_attributes *attr, u16 attr_cnt,
+	     struct ice_fv_word *es, u16 *masks);
 enum ice_status
 ice_add_prof_id_flow(struct ice_hw *hw, enum ice_block blk, u16 vsi, u64 hdl);
 enum ice_status

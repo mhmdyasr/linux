@@ -9,7 +9,6 @@
 int main(void)
 {
 	/* offsets into the task struct */
-	DEFINE(TASK_STATE,        offsetof(struct task_struct, state));
 	DEFINE(TASK_THREAD_INFO,  offsetof(struct task_struct, stack));
 	DEFINE(TASK_FLAGS,        offsetof(struct task_struct, flags));
 	DEFINE(TASK_PTRACE,       offsetof(struct task_struct, ptrace));
@@ -18,8 +17,7 @@ int main(void)
 	DEFINE(TASK_ACTIVE_MM,    offsetof(struct task_struct, active_mm));
 
 	/* offsets into the thread struct */
-	DEFINE(THREAD_KSP,        offsetof(struct thread_struct, ksp));
-	DEFINE(THREAD_SR,         offsetof(struct thread_struct, sr));
+	DEFINE(THREAD_KSP,        offsetof(struct thread_struct, sp));
 	DEFINE(THREAD_FESR,       offsetof(struct thread_struct, user_fp.fesr));
 	DEFINE(THREAD_FCR,        offsetof(struct thread_struct, user_fp.fcr));
 	DEFINE(THREAD_FPREG,      offsetof(struct thread_struct, user_fp.vr));

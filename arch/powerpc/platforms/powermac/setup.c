@@ -51,7 +51,6 @@
 #include <asm/reg.h>
 #include <asm/sections.h>
 #include <asm/prom.h>
-#include <asm/pgtable.h>
 #include <asm/io.h>
 #include <asm/pci-bridge.h>
 #include <asm/ohare.h>
@@ -79,8 +78,6 @@ int has_l2cache = 0;
 int pmac_newworld;
 
 static int current_root_goodness = -1;
-
-extern struct machdep_calls pmac_md;
 
 #define DEFAULT_ROOT_DEVICE Root_SDA1	/* sda1 - slightly silly choice */
 
@@ -285,7 +282,7 @@ static void __init pmac_setup_arch(void)
 				/* 604, G3, G4 etc. */
 				loops_per_jiffy = *fp / HZ;
 			else
-				/* 601, 603, etc. */
+				/* 603, etc. */
 				loops_per_jiffy = *fp / (2 * HZ);
 			of_node_put(cpu);
 			break;
@@ -298,9 +295,6 @@ static void __init pmac_setup_arch(void)
 		pmac_newworld = 1;
 		of_node_put(ic);
 	}
-
-	/* Lookup PCI hosts */
-	pmac_pci_init();
 
 #ifdef CONFIG_PPC32
 	ohare_init();
@@ -601,6 +595,7 @@ define_machine(powermac) {
 	.name			= "PowerMac",
 	.probe			= pmac_probe,
 	.setup_arch		= pmac_setup_arch,
+	.discover_phbs		= pmac_pci_init,
 	.show_cpuinfo		= pmac_show_cpuinfo,
 	.init_IRQ		= pmac_pic_init,
 	.get_irq		= NULL,	/* changed later */

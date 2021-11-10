@@ -5,7 +5,6 @@
  * Copyright 2018 Google LLC.
  */
 
-#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include "sdm845.dtsi"
@@ -548,6 +547,8 @@ edp_brij_i2c: &i2c3 {
 		clocks = <&rpmhcc RPMH_LN_BB_CLK2>;
 		clock-names = "refclk";
 
+		no-hpd;
+
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -614,6 +615,14 @@ ap_ts_i2c: &i2c14 {
 	};
 };
 
+&gmu {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
 &ipa {
 	status = "okay";
 	modem-init;
@@ -627,8 +636,20 @@ ap_ts_i2c: &i2c14 {
 	status = "okay";
 };
 
-&mdss_mdp {
+/*
+ * Cheza fw does not properly program the GPU aperture to allow the
+ * GPU to update the SMMU pagetables for context switches.  Work
+ * around this by dropping the "qcom,adreno-smmu" compat string.
+ */
+&adreno_smmu {
+	compatible = "qcom,sdm845-smmu-v2", "qcom,smmu-v2";
+};
+
+&mss_pil {
 	status = "okay";
+
+	iommus = <&apps_smmu 0x781 0x0>,
+		 <&apps_smmu 0x724 0x3>;
 };
 
 &pm8998_pwrkey {
@@ -637,10 +658,12 @@ ap_ts_i2c: &i2c14 {
 
 &qupv3_id_0 {
 	status = "okay";
+	iommus = <&apps_smmu 0x0 0x3>;
 };
 
 &qupv3_id_1 {
 	status = "okay";
+	iommus = <&apps_smmu 0x6c0 0x3>;
 };
 
 &sdhc_2 {
@@ -695,10 +718,6 @@ ap_ts_i2c: &i2c14 {
 			google,remote-bus = <0>;
 			#address-cells = <1>;
 			#size-cells = <0>;
-		};
-
-		pdupdate {
-			compatible = "google,cros-ec-pd-update";
 		};
 	};
 };
@@ -1303,6 +1322,8 @@ ap_ts_i2c: &i2c14 {
 };
 
 &venus {
+	status = "okay";
+
 	video-firmware {
 		iommus = <&apps_smmu 0x10b2 0x0>;
 	};

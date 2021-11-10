@@ -72,7 +72,6 @@
 #define PTRS_PER_PGD	128
 #endif
 #define USER_PTRS_PER_PGD	(TASK_SIZE/PGDIR_SIZE)
-#define FIRST_USER_ADDRESS	0UL
 
 /* Virtual address region for use by kernel_map() */
 #ifdef CONFIG_SUN3
@@ -176,7 +175,6 @@ pgprot_t pgprot_dmacoherent(pgprot_t prot);
 #define pgprot_dmacoherent(prot)	pgprot_dmacoherent(prot)
 
 #endif /* CONFIG_COLDFIRE */
-#include <asm-generic/pgtable.h>
 #endif /* !__ASSEMBLY__ */
 
 #endif /* _M68K_PGTABLE_H */

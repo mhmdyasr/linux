@@ -79,10 +79,7 @@ static int uapi_create_write(struct uverbs_api *uapi,
 
 	method_elm->is_ex = def->write.is_ex;
 	method_elm->handler = def->func_write;
-	if (def->write.is_ex)
-		method_elm->disabled = !(ibdev->uverbs_ex_cmd_mask &
-					 BIT_ULL(def->write.command_num));
-	else
+	if (!def->write.is_ex)
 		method_elm->disabled = !(ibdev->uverbs_cmd_mask &
 					 BIT_ULL(def->write.command_num));
 
@@ -520,7 +517,7 @@ static void uapi_key_okay(u32 key)
 		count++;
 	if (uapi_key_is_attr(key))
 		count++;
-	WARN(count != 1, "Bad count %d key=%x", count, key);
+	WARN(count != 1, "Bad count %u key=%x", count, key);
 }
 
 static void uapi_finalize_disable(struct uverbs_api *uapi)
@@ -634,6 +631,9 @@ static const struct uapi_definition uverbs_core_api[] = {
 	UAPI_DEF_CHAIN(uverbs_def_obj_flow_action),
 	UAPI_DEF_CHAIN(uverbs_def_obj_intf),
 	UAPI_DEF_CHAIN(uverbs_def_obj_mr),
+	UAPI_DEF_CHAIN(uverbs_def_obj_qp),
+	UAPI_DEF_CHAIN(uverbs_def_obj_srq),
+	UAPI_DEF_CHAIN(uverbs_def_obj_wq),
 	UAPI_DEF_CHAIN(uverbs_def_write_intf),
 	{},
 };

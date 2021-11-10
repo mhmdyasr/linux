@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -9,12 +10,10 @@
 #include <util/util.h>
 #include <util/bpf-loader.h>
 #include <util/evlist.h>
-#include <linux/bpf.h>
 #include <linux/filter.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <api/fs/fs.h>
-#include <bpf/bpf.h>
 #include <perf/mmap.h>
 #include "tests.h"
 #include "llvm.h"
@@ -25,6 +24,8 @@
 #define PERF_TEST_BPF_PATH "/sys/fs/bpf/perf_test"
 
 #ifdef HAVE_LIBBPF_SUPPORT
+#include <linux/bpf.h>
+#include <bpf/bpf.h>
 
 static int epoll_pwait_loop(void)
 {
@@ -86,7 +87,7 @@ static struct {
 		.msg_load_fail	  = "check your vmlinux setting?",
 		.target_func	  = &epoll_pwait_loop,
 		.expect_result	  = (NR_ITERS + 1) / 2,
-		.pin 		  = true,
+		.pin		  = true,
 	},
 #ifdef HAVE_BPF_PROLOGUE
 	{
@@ -99,13 +100,6 @@ static struct {
 		.expect_result	  = (NR_ITERS + 1) / 4,
 	},
 #endif
-	{
-		.prog_id	  = LLVM_TESTCASE_BPF_RELOCATION,
-		.desc		  = "BPF relocation checker",
-		.name		  = "[bpf_relocation_test]",
-		.msg_compile_fail = "fix 'perf test LLVM' first",
-		.msg_load_fail	  = "libbpf error when dealing with relocation",
-	},
 };
 
 static int do_test(struct bpf_object *obj, int (*func)(void),
@@ -129,12 +123,13 @@ static int do_test(struct bpf_object *obj, int (*func)(void),
 	struct parse_events_state parse_state;
 	struct parse_events_error parse_error;
 
-	bzero(&parse_error, sizeof(parse_error));
+	parse_events_error__init(&parse_error);
 	bzero(&parse_state, sizeof(parse_state));
 	parse_state.error = &parse_error;
 	INIT_LIST_HEAD(&parse_state.list);
 
 	err = parse_events_load_bpf_obj(&parse_state, &parse_state.list, obj, NULL);
+	parse_events_error__exit(&parse_error);
 	if (err || list_empty(&parse_state.list)) {
 		pr_debug("Failed to add events selected by BPF\n");
 		return TEST_FAIL;
@@ -144,23 +139,23 @@ static int do_test(struct bpf_object *obj, int (*func)(void),
 	pid[sizeof(pid) - 1] = '\0';
 	opts.target.tid = opts.target.pid = pid;
 
-	/* Instead of perf_evlist__new_default, don't add default events */
+	/* Instead of evlist__new_default, don't add default events */
 	evlist = evlist__new();
 	if (!evlist) {
 		pr_debug("Not enough memory to create evlist\n");
 		return TEST_FAIL;
 	}
 
-	err = perf_evlist__create_maps(evlist, &opts.target);
+	err = evlist__create_maps(evlist, &opts.target);
 	if (err < 0) {
 		pr_debug("Not enough memory to create thread/cpu maps\n");
 		goto out_delete_evlist;
 	}
 
-	perf_evlist__splice_list_tail(evlist, &parse_state.list);
-	evlist->nr_groups = parse_state.nr_groups;
+	evlist__splice_list_tail(evlist, &parse_state.list);
+	evlist->core.nr_groups = parse_state.nr_groups;
 
-	perf_evlist__config(evlist, &opts, NULL);
+	evlist__config(evlist, &opts, NULL);
 
 	err = evlist__open(evlist);
 	if (err < 0) {
@@ -197,8 +192,8 @@ static int do_test(struct bpf_object *obj, int (*func)(void),
 		perf_mmap__read_done(&md->core);
 	}
 
-	if (count != expect) {
-		pr_debug("BPF filter result incorrect, expected %d, got %d samples\n", expect, count);
+	if (count != expect * evlist->core.nr_entries) {
+		pr_debug("BPF filter result incorrect, expected %d, got %d samples\n", expect * evlist->core.nr_entries, count);
 		goto out_delete_evlist;
 	}
 
@@ -283,6 +278,7 @@ static int __test__bpf(int idx)
 	}
 
 out:
+	free(obj_buf);
 	bpf__clear();
 	return ret;
 }

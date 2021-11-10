@@ -35,7 +35,7 @@ static int aq_apply_macsec_cfg(struct aq_nic_s *nic);
 static int aq_apply_secy_cfg(struct aq_nic_s *nic,
 			     const struct macsec_secy *secy);
 
-static void aq_ether_addr_to_mac(u32 mac[2], unsigned char *emac)
+static void aq_ether_addr_to_mac(u32 mac[2], const unsigned char *emac)
 {
 	u32 tmp[2] = { 0 };
 
@@ -401,7 +401,7 @@ static u32 aq_sc_idx_max(const enum aq_macsec_sc_sa sc_sa)
 		break;
 	default:
 		break;
-	};
+	}
 
 	return result;
 }
@@ -417,7 +417,7 @@ static u32 aq_to_hw_sc_idx(const u32 sc_idx, const enum aq_macsec_sc_sa sc_sa)
 		return sc_idx;
 	default:
 		WARN_ONCE(true, "Invalid sc_sa");
-	};
+	}
 
 	return sc_idx;
 }
@@ -478,7 +478,7 @@ static int aq_mdo_add_secy(struct macsec_context *ctx)
 
 	set_bit(txsc_idx, &cfg->txsc_idx_busy);
 
-	return 0;
+	return ret;
 }
 
 static int aq_mdo_upd_secy(struct macsec_context *ctx)

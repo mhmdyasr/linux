@@ -149,6 +149,7 @@ static int prism2_bss_list_proc_show(struct seq_file *m, void *v)
 }
 
 static void *prism2_bss_list_proc_start(struct seq_file *m, loff_t *_pos)
+	__acquires(&local->lock)
 {
 	local_info_t *local = PDE_DATA(file_inode(m->file));
 	spin_lock_bh(&local->lock);
@@ -162,6 +163,7 @@ static void *prism2_bss_list_proc_next(struct seq_file *m, void *v, loff_t *_pos
 }
 
 static void prism2_bss_list_proc_stop(struct seq_file *m, void *v)
+	__releases(&local->lock)
 {
 	local_info_t *local = PDE_DATA(file_inode(m->file));
 	spin_unlock_bh(&local->lock);
@@ -225,6 +227,7 @@ static ssize_t prism2_aux_dump_proc_no_read(struct file *file, char __user *buf,
 
 static const struct proc_ops prism2_aux_dump_proc_ops = {
 	.proc_read	= prism2_aux_dump_proc_no_read,
+	.proc_lseek	= default_llseek,
 };
 
 

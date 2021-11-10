@@ -9,15 +9,16 @@
 
 #include <linux/init.h>
 #include <linux/linkage.h>
+#include <linux/pgtable.h>
 #include <asm/assembler.h>
 #include <asm/asm-offsets.h>
 #include <asm/asm_pointer_auth.h>
 #include <asm/hwcap.h>
-#include <asm/pgtable.h>
 #include <asm/pgtable-hwdef.h>
 #include <asm/cpufeature.h>
 #include <asm/alternative.h>
 #include <asm/smp.h>
+#include <asm/sysreg.h>
 
 #ifdef CONFIG_ARM64_64K_PAGES
 #define TCR_TG_FLAGS	TCR_TG0_64K | TCR_TG1_64K
@@ -39,25 +40,39 @@
 #define TCR_CACHE_FLAGS	TCR_IRGN_WBWA | TCR_ORGN_WBWA
 
 #ifdef CONFIG_KASAN_SW_TAGS
-#define TCR_KASAN_FLAGS TCR_TBI1
+#define TCR_KASAN_SW_FLAGS TCR_TBI1 | TCR_TBID1
 #else
-#define TCR_KASAN_FLAGS 0
+#define TCR_KASAN_SW_FLAGS 0
 #endif
 
-/* Default MAIR_EL1 */
+#ifdef CONFIG_KASAN_HW_TAGS
+#define TCR_MTE_FLAGS SYS_TCR_EL1_TCMA1 | TCR_TBI1 | TCR_TBID1
+#else
+/*
+ * The mte_zero_clear_page_tags() implementation uses DC GZVA, which relies on
+ * TBI being enabled at EL1.
+ */
+#define TCR_MTE_FLAGS TCR_TBI1 | TCR_TBID1
+#endif
+
+/*
+ * Default MAIR_EL1. MT_NORMAL_TAGGED is initially mapped as Normal memory and
+ * changed during __cpu_setup to Normal Tagged if the system supports MTE.
+ */
 #define MAIR_EL1_SET							\
 	(MAIR_ATTRIDX(MAIR_ATTR_DEVICE_nGnRnE, MT_DEVICE_nGnRnE) |	\
 	 MAIR_ATTRIDX(MAIR_ATTR_DEVICE_nGnRE, MT_DEVICE_nGnRE) |	\
-	 MAIR_ATTRIDX(MAIR_ATTR_DEVICE_GRE, MT_DEVICE_GRE) |		\
 	 MAIR_ATTRIDX(MAIR_ATTR_NORMAL_NC, MT_NORMAL_NC) |		\
 	 MAIR_ATTRIDX(MAIR_ATTR_NORMAL, MT_NORMAL) |			\
-	 MAIR_ATTRIDX(MAIR_ATTR_NORMAL_WT, MT_NORMAL_WT))
+	 MAIR_ATTRIDX(MAIR_ATTR_NORMAL, MT_NORMAL_TAGGED))
 
 #ifdef CONFIG_CPU_PM
 /**
  * cpu_do_suspend - save CPU registers context
  *
  * x0: virtual address of context pointer
+ *
+ * This must be kept in sync with struct cpu_suspend_ctx in <asm/suspend.h>.
  */
 SYM_FUNC_START(cpu_do_suspend)
 	mrs	x2, tpidr_el0
@@ -70,11 +85,7 @@ SYM_FUNC_START(cpu_do_suspend)
 	mrs	x9, mdscr_el1
 	mrs	x10, oslsr_el1
 	mrs	x11, sctlr_el1
-alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
-	mrs	x12, tpidr_el1
-alternative_else
-	mrs	x12, tpidr_el2
-alternative_endif
+	get_this_cpu_offset x12
 	mrs	x13, sp_el0
 	stp	x2, x3, [x0]
 	stp	x4, x5, [x0, #16]
@@ -82,6 +93,11 @@ alternative_endif
 	stp	x8, x9, [x0, #48]
 	stp	x10, x11, [x0, #64]
 	stp	x12, x13, [x0, #80]
+	/*
+	 * Save x18 as it may be used as a platform register, e.g. by shadow
+	 * call stack.
+	 */
+	str	x18, [x0, #96]
 	ret
 SYM_FUNC_END(cpu_do_suspend)
 
@@ -98,6 +114,13 @@ SYM_FUNC_START(cpu_do_resume)
 	ldp	x9, x10, [x0, #48]
 	ldp	x11, x12, [x0, #64]
 	ldp	x13, x14, [x0, #80]
+	/*
+	 * Restore x18, as it may be used as a platform register, and clear
+	 * the buffer to minimize the risk of exposure when used for shadow
+	 * call stack.
+	 */
+	ldr	x18, [x0, #96]
+	str	xzr, [x0, #96]
 	msr	tpidr_el0, x2
 	msr	tpidrro_el0, x3
 	msr	contextidr_el1, x4
@@ -120,11 +143,7 @@ SYM_FUNC_START(cpu_do_resume)
 	msr	mdscr_el1, x10
 
 	msr	sctlr_el1, x12
-alternative_if_not ARM64_HAS_VIRT_HOST_EXTN
-	msr	tpidr_el1, x13
-alternative_else
-	msr	tpidr_el2, x13
-alternative_endif
+	set_this_cpu_offset x13
 	msr	sp_el0, x14
 	/*
 	 * Restore oslsr_el1 by writing oslar_el1
@@ -139,7 +158,7 @@ alternative_if ARM64_HAS_RAS_EXTN
 	msr_s	SYS_DISR_EL1, xzr
 alternative_else_nop_endif
 
-	ptrauth_keys_install_kernel x14, 0, x1, x2, x3
+	ptrauth_keys_install_kernel_nosync x14, x1, x2, x3
 	isb
 	ret
 SYM_FUNC_END(cpu_do_resume)
@@ -149,7 +168,7 @@ SYM_FUNC_END(cpu_do_resume)
 	.pushsection ".idmap.text", "awx"
 
 .macro	__idmap_cpu_set_reserved_ttbr1, tmp1, tmp2
-	adrp	\tmp1, empty_zero_page
+	adrp	\tmp1, reserved_pg_dir
 	phys_to_ttbr \tmp2, \tmp1
 	offset_ttbr1 \tmp2, \tmp1
 	msr	ttbr1_el1, \tmp2
@@ -266,17 +285,7 @@ skip_pgd:
 	/* We're done: fire up the MMU again */
 	mrs	x17, sctlr_el1
 	orr	x17, x17, #SCTLR_ELx_M
-	msr	sctlr_el1, x17
-	isb
-
-	/*
-	 * Invalidate the local I-cache so that any instructions fetched
-	 * speculatively from the PoC are discarded, since they may have
-	 * been dynamically patched at the PoU.
-	 */
-	ic	iallu
-	dsb	nsh
-	isb
+	set_sctlr_el1	x17
 
 	/* Set the flag to zero to indicate that we're all done */
 	str	wzr, [flag_ptr]
@@ -386,8 +395,6 @@ SYM_FUNC_END(idmap_kpti_install_ng_mappings)
  *
  *	Initialise the processor for turning the MMU on.
  *
- * Input:
- *	x0 with a flag ARM64_CPU_BOOT_PRIMARY/ARM64_CPU_BOOT_SECONDARY/ARM64_CPU_RUNTIME.
  * Output:
  *	Return in x0 the value of the SCTLR_EL1 register.
  */
@@ -406,33 +413,70 @@ SYM_FUNC_START(__cpu_setup)
 	reset_amuserenr_el0 x1			// Disable AMU access from EL0
 
 	/*
-	 * Memory region attributes
+	 * Default values for VMSA control registers. These will be adjusted
+	 * below depending on detected CPU features.
 	 */
-	mov_q	x5, MAIR_EL1_SET
-	msr	mair_el1, x5
-	/*
-	 * Set/prepare TCR and TTBR. We use 512GB (39-bit) address range for
-	 * both user and kernel.
-	 */
-	mov_q	x10, TCR_TxSZ(VA_BITS) | TCR_CACHE_FLAGS | TCR_SMP_FLAGS | \
+	mair	.req	x17
+	tcr	.req	x16
+	mov_q	mair, MAIR_EL1_SET
+	mov_q	tcr, TCR_TxSZ(VA_BITS) | TCR_CACHE_FLAGS | TCR_SMP_FLAGS | \
 			TCR_TG_FLAGS | TCR_KASLR_FLAGS | TCR_ASID16 | \
-			TCR_TBI0 | TCR_A1 | TCR_KASAN_FLAGS
-	tcr_clear_errata_bits x10, x9, x5
+			TCR_TBI0 | TCR_A1 | TCR_KASAN_SW_FLAGS
+
+#ifdef CONFIG_ARM64_MTE
+	/*
+	 * Update MAIR_EL1, GCR_EL1 and TFSR*_EL1 if MTE is supported
+	 * (ID_AA64PFR1_EL1[11:8] > 1).
+	 */
+	mrs	x10, ID_AA64PFR1_EL1
+	ubfx	x10, x10, #ID_AA64PFR1_MTE_SHIFT, #4
+	cmp	x10, #ID_AA64PFR1_MTE
+	b.lt	1f
+
+	/* Normal Tagged memory type at the corresponding MAIR index */
+	mov	x10, #MAIR_ATTR_NORMAL_TAGGED
+	bfi	mair, x10, #(8 *  MT_NORMAL_TAGGED), #8
+
+	mov	x10, #KERNEL_GCR_EL1
+	msr_s	SYS_GCR_EL1, x10
+
+	/*
+	 * If GCR_EL1.RRND=1 is implemented the same way as RRND=0, then
+	 * RGSR_EL1.SEED must be non-zero for IRG to produce
+	 * pseudorandom numbers. As RGSR_EL1 is UNKNOWN out of reset, we
+	 * must initialize it.
+	 */
+	mrs	x10, CNTVCT_EL0
+	ands	x10, x10, #SYS_RGSR_EL1_SEED_MASK
+	csinc	x10, x10, xzr, ne
+	lsl	x10, x10, #SYS_RGSR_EL1_SEED_SHIFT
+	msr_s	SYS_RGSR_EL1, x10
+
+	/* clear any pending tag check faults in TFSR*_EL1 */
+	msr_s	SYS_TFSR_EL1, xzr
+	msr_s	SYS_TFSRE0_EL1, xzr
+
+	/* set the TCR_EL1 bits */
+	mov_q	x10, TCR_MTE_FLAGS
+	orr	tcr, tcr, x10
+1:
+#endif
+	tcr_clear_errata_bits tcr, x9, x5
 
 #ifdef CONFIG_ARM64_VA_BITS_52
 	ldr_l		x9, vabits_actual
 	sub		x9, xzr, x9
 	add		x9, x9, #64
-	tcr_set_t1sz	x10, x9
+	tcr_set_t1sz	tcr, x9
 #else
 	ldr_l		x9, idmap_t0sz
 #endif
-	tcr_set_t0sz	x10, x9
+	tcr_set_t0sz	tcr, x9
 
 	/*
 	 * Set the IPS bits in TCR_EL1.
 	 */
-	tcr_compute_pa_size x10, #TCR_IPS_SHIFT, x5, x6
+	tcr_compute_pa_size tcr, #TCR_IPS_SHIFT, x5, x6
 #ifdef CONFIG_ARM64_HW_AFDBM
 	/*
 	 * Enable hardware update of the Access Flags bit.
@@ -442,55 +486,17 @@ SYM_FUNC_START(__cpu_setup)
 	mrs	x9, ID_AA64MMFR1_EL1
 	and	x9, x9, #0xf
 	cbz	x9, 1f
-	orr	x10, x10, #TCR_HA		// hardware Access flag update
+	orr	tcr, tcr, #TCR_HA		// hardware Access flag update
 1:
 #endif	/* CONFIG_ARM64_HW_AFDBM */
-	msr	tcr_el1, x10
-	mov	x1, x0
+	msr	mair_el1, mair
+	msr	tcr_el1, tcr
 	/*
 	 * Prepare SCTLR
 	 */
-	mov_q	x0, SCTLR_EL1_SET
-
-#ifdef CONFIG_ARM64_PTR_AUTH
-	/* No ptrauth setup for run time cpus */
-	cmp	x1, #ARM64_CPU_RUNTIME
-	b.eq	3f
-
-	/* Check if the CPU supports ptrauth */
-	mrs	x2, id_aa64isar1_el1
-	ubfx	x2, x2, #ID_AA64ISAR1_APA_SHIFT, #8
-	cbz	x2, 3f
-
-	/*
-	 * The primary cpu keys are reset here and can be
-	 * re-initialised with some proper values later.
-	 */
-	msr_s	SYS_APIAKEYLO_EL1, xzr
-	msr_s	SYS_APIAKEYHI_EL1, xzr
-
-	/* Just enable ptrauth for primary cpu */
-	cmp	x1, #ARM64_CPU_BOOT_PRIMARY
-	b.eq	2f
-
-	/* if !system_supports_address_auth() then skip enable */
-alternative_if_not ARM64_HAS_ADDRESS_AUTH
-	b	3f
-alternative_else_nop_endif
-
-	/* Install ptrauth key for secondary cpus */
-	adr_l	x2, secondary_data
-	ldr	x3, [x2, #CPU_BOOT_TASK]	// get secondary_data.task
-	cbz	x3, 2f				// check for slow booting cpus
-	ldp	x3, x4, [x2, #CPU_BOOT_PTRAUTH_KEY]
-	msr_s	SYS_APIAKEYLO_EL1, x3
-	msr_s	SYS_APIAKEYHI_EL1, x4
-
-2:	/* Enable ptrauth instructions */
-	ldr	x2, =SCTLR_ELx_ENIA | SCTLR_ELx_ENIB | \
-		     SCTLR_ELx_ENDA | SCTLR_ELx_ENDB
-	orr	x0, x0, x2
-3:
-#endif
+	mov_q	x0, INIT_SCTLR_EL1_MMU_ON
 	ret					// return to head.S
+
+	.unreq	mair
+	.unreq	tcr
 SYM_FUNC_END(__cpu_setup)

@@ -5,7 +5,7 @@
  * Benchmark the various operations allowed for epoll_ctl(2).
  * The idea is to concurrently stress a single epoll instance
  */
-#ifdef HAVE_EVENTFD
+#ifdef HAVE_EVENTFD_SUPPORT
 /* For the CLR_() macros */
 #include <string.h>
 #include <pthread.h>
@@ -21,7 +21,6 @@
 #include <sys/resource.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <internal/cpumap.h>
 #include <perf/cpumap.h>
 
 #include "../util/stat.h"
@@ -412,4 +411,4 @@ int bench_epoll_ctl(int argc, const char **argv)
 errmem:
 	err(EXIT_FAILURE, "calloc");
 }
-#endif // HAVE_EVENTFD
+#endif // HAVE_EVENTFD_SUPPORT

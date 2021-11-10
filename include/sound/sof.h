@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-3-Clause) */
 /*
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
@@ -26,6 +26,9 @@ struct snd_sof_pdata {
 	const char *platform;
 
 	struct device *dev;
+
+	/* indicate how many first bytes shouldn't be loaded into DSP memory. */
+	size_t fw_offset;
 
 	/*
 	 * notification callback used if the hardware initialization
@@ -63,17 +66,14 @@ struct sof_dev_desc {
 	/* alternate list of machines using this configuration */
 	struct snd_soc_acpi_mach *alt_machines;
 
+	bool use_acpi_target_states;
+
 	/* Platform resource indexes in BAR / ACPI resources. */
 	/* Must set to -1 if not used - add new items to end */
 	int resindex_lpe_base;
 	int resindex_pcicfg_base;
 	int resindex_imr_base;
 	int irqindex_host_ipc;
-	int resindex_dma_base;
-
-	/* DMA only valid when resindex_dma_base != -1*/
-	int dma_engine;
-	int dma_size;
 
 	/* IPC timeouts in ms */
 	int ipc_timeout;
@@ -95,6 +95,7 @@ struct sof_dev_desc {
 	const struct snd_sof_dsp_ops *ops;
 };
 
-int sof_nocodec_setup(struct device *dev,
-		      const struct snd_sof_dsp_ops *ops);
+int sof_dai_get_mclk(struct snd_soc_pcm_runtime *rtd);
+int sof_dai_get_bclk(struct snd_soc_pcm_runtime *rtd);
+
 #endif
