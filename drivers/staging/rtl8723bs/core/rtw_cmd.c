@@ -518,7 +518,7 @@ post_process:
 	complete(&pcmdpriv->terminate_cmdthread_comp);
 	atomic_set(&pcmdpriv->cmdthd_running, false);
 
-	thread_exit();
+	return 0;
 }
 
 /*
@@ -1498,8 +1498,7 @@ static void rtw_lps_change_dtim_hdl(struct adapter *padapter, u8 dtim)
 
 	mutex_lock(&pwrpriv->lock);
 
-	if (pwrpriv->dtim != dtim)
-		pwrpriv->dtim = dtim;
+	pwrpriv->dtim = dtim;
 
 	if (pwrpriv->fw_current_in_ps_mode && (pwrpriv->pwr_mode > PS_MODE_ACTIVE)) {
 		u8 ps_mode = pwrpriv->pwr_mode;

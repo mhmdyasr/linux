@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Synopsys DesignWare MAC Device Tree Bindings
 
 maintainers:
-  - Alexandre Torgue <alexandre.torgue@st.com>
+  - Alexandre Torgue <alexandre.torgue@foss.st.com>
   - Giuseppe Cavallaro <peppe.cavallaro@st.com>
   - Jose Abreu <joabreu@synopsys.com>
 
@@ -286,7 +286,8 @@ properties:
       MAC2MAC connection.
 
   mdio:
-    type: object
+    $ref: mdio.yaml#
+    unevaluatedProperties: false
     description:
       Creates and registers an MDIO bus.
 
@@ -326,6 +327,9 @@ allOf:
               - ingenic,x1600-mac
               - ingenic,x1830-mac
               - ingenic,x2000-mac
+              - snps,dwmac-3.50a
+              - snps,dwmac-4.10a
+              - snps,dwmac-4.20a
               - snps,dwxgmac
               - snps,dwxgmac-2.10
               - st,spear600-gmac

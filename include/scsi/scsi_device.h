@@ -226,12 +226,6 @@ struct scsi_device {
 
 	struct device		sdev_gendev,
 				sdev_dev;
-	/*
-	 * The array size 6 provides space for one attribute group for the
-	 * SCSI core, four attribute groups defined by SCSI LLDs and one
-	 * terminating NULL pointer.
-	 */
-	const struct attribute_group *gendev_attr_groups[6];
 
 	struct execute_work	ew; /* used to get process context on put */
 	struct work_struct	requeue_work;
@@ -281,9 +275,9 @@ scmd_printk(const char *, const struct scsi_cmnd *, const char *, ...);
 	do {								\
 		struct request *__rq = scsi_cmd_to_rq((scmd));		\
 									\
-		if (__rq->rq_disk)					\
+		if (__rq->q->disk)					\
 			sdev_dbg((scmd)->device, "[%s] " fmt,		\
-				 __rq->rq_disk->disk_name, ##a);	\
+				 __rq->q->disk->disk_name, ##a);	\
 		else							\
 			sdev_dbg((scmd)->device, fmt, ##a);		\
 	} while (0)
@@ -421,9 +415,8 @@ extern int scsi_mode_sense(struct scsi_device *sdev, int dbd, int modepage,
 			   int retries, struct scsi_mode_data *data,
 			   struct scsi_sense_hdr *);
 extern int scsi_mode_select(struct scsi_device *sdev, int pf, int sp,
-			    int modepage, unsigned char *buffer, int len,
-			    int timeout, int retries,
-			    struct scsi_mode_data *data,
+			    unsigned char *buffer, int len, int timeout,
+			    int retries, struct scsi_mode_data *data,
 			    struct scsi_sense_hdr *);
 extern int scsi_test_unit_ready(struct scsi_device *sdev, int timeout,
 				int retries, struct scsi_sense_hdr *sshdr);

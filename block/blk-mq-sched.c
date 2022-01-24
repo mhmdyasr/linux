@@ -18,32 +18,6 @@
 #include "blk-mq-tag.h"
 #include "blk-wbt.h"
 
-void blk_mq_sched_assign_ioc(struct request *rq)
-{
-	struct request_queue *q = rq->q;
-	struct io_context *ioc;
-	struct io_cq *icq;
-
-	/*
-	 * May not have an IO context if it's a passthrough request
-	 */
-	ioc = current->io_context;
-	if (!ioc)
-		return;
-
-	spin_lock_irq(&q->queue_lock);
-	icq = ioc_lookup_icq(ioc, q);
-	spin_unlock_irq(&q->queue_lock);
-
-	if (!icq) {
-		icq = ioc_create_icq(ioc, q, GFP_ATOMIC);
-		if (!icq)
-			return;
-	}
-	get_io_context(icq->ioc);
-	rq->elv.icq = icq;
-}
-
 /*
  * Mark a hardware queue as needing a restart. For shared queues, maintain
  * a count of how many hardware queues are marked for restart.
@@ -370,9 +344,6 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
 	bool ret = false;
 	enum hctx_type type;
 
-	if (bio_queue_enter(bio))
-		return false;
-
 	if (e && e->type->ops.bio_merge) {
 		ret = e->type->ops.bio_merge(q, bio, nr_segs);
 		goto out_put;
@@ -397,7 +368,6 @@ bool blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
 
 	spin_unlock(&ctx->lock);
 out_put:
-	blk_queue_exit(q);
 	return ret;
 }
 
@@ -505,7 +475,8 @@ void blk_mq_sched_insert_requests(struct blk_mq_hw_ctx *hctx,
 		 * us one extra enqueue & dequeue to sw queue.
 		 */
 		if (!hctx->dispatch_busy && !run_queue_async) {
-			blk_mq_try_issue_list_directly(hctx, list);
+			blk_mq_run_dispatch_ops(hctx->queue,
+				blk_mq_try_issue_list_directly(hctx, list));
 			if (list_empty(list))
 				goto out;
 		}
