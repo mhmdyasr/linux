@@ -218,7 +218,7 @@ struct arasan_cf_dev {
 	struct ata_queued_cmd *qc;
 };
 
-static struct scsi_host_template arasan_cf_sht = {
+static const struct scsi_host_template arasan_cf_sht = {
 	ATA_BASE_SHT(DRIVER_NAME),
 	.dma_boundary = 0xFFFFFFFFUL,
 };
@@ -937,7 +937,8 @@ static int arasan_cf_suspend(struct device *dev)
 		dmaengine_terminate_all(acdev->dma_chan);
 
 	cf_exit(acdev);
-	return ata_host_suspend(host, PMSG_SUSPEND);
+	ata_host_suspend(host, PMSG_SUSPEND);
+	return 0;
 }
 
 static int arasan_cf_resume(struct device *dev)

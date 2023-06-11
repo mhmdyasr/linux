@@ -6,6 +6,7 @@
 
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -843,8 +844,7 @@ static const struct attribute_group *lt9611uxc_attr_groups[] = {
 	NULL,
 };
 
-static int lt9611uxc_probe(struct i2c_client *client,
-			   const struct i2c_device_id *id)
+static int lt9611uxc_probe(struct i2c_client *client)
 {
 	struct lt9611uxc *lt9611uxc;
 	struct device *dev = &client->dev;
@@ -860,7 +860,7 @@ static int lt9611uxc_probe(struct i2c_client *client,
 	if (!lt9611uxc)
 		return -ENOMEM;
 
-	lt9611uxc->dev = &client->dev;
+	lt9611uxc->dev = dev;
 	lt9611uxc->client = client;
 	mutex_init(&lt9611uxc->ocm_lock);
 
@@ -870,7 +870,7 @@ static int lt9611uxc_probe(struct i2c_client *client,
 		return PTR_ERR(lt9611uxc->regmap);
 	}
 
-	ret = lt9611uxc_parse_dt(&client->dev, lt9611uxc);
+	ret = lt9611uxc_parse_dt(dev, lt9611uxc);
 	if (ret) {
 		dev_err(dev, "failed to parse device tree\n");
 		return ret;
@@ -977,12 +977,12 @@ err_of_put:
 	return ret;
 }
 
-static int lt9611uxc_remove(struct i2c_client *client)
+static void lt9611uxc_remove(struct i2c_client *client)
 {
 	struct lt9611uxc *lt9611uxc = i2c_get_clientdata(client);
 
 	disable_irq(client->irq);
-	flush_scheduled_work();
+	cancel_work_sync(&lt9611uxc->work);
 	lt9611uxc_audio_exit(lt9611uxc);
 	drm_bridge_remove(&lt9611uxc->bridge);
 
@@ -992,8 +992,6 @@ static int lt9611uxc_remove(struct i2c_client *client)
 
 	of_node_put(lt9611uxc->dsi1_node);
 	of_node_put(lt9611uxc->dsi0_node);
-
-	return 0;
 }
 
 static struct i2c_device_id lt9611uxc_id[] = {
@@ -1013,7 +1011,7 @@ static struct i2c_driver lt9611uxc_driver = {
 		.of_match_table = lt9611uxc_match_table,
 		.dev_groups = lt9611uxc_attr_groups,
 	},
-	.probe = lt9611uxc_probe,
+	.probe_new = lt9611uxc_probe,
 	.remove = lt9611uxc_remove,
 	.id_table = lt9611uxc_id,
 };

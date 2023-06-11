@@ -376,7 +376,7 @@ static ssize_t rnbd_clt_resize_dev_store(struct kobject *kobj,
 	if (ret)
 		return ret;
 
-	ret = rnbd_clt_resize_disk(dev, (size_t)sectors);
+	ret = rnbd_clt_resize_disk(dev, sectors);
 	if (ret)
 		return ret;
 
@@ -646,7 +646,7 @@ int rnbd_clt_create_sysfs_files(void)
 {
 	int err;
 
-	rnbd_dev_class = class_create(THIS_MODULE, "rnbd-client");
+	rnbd_dev_class = class_create("rnbd-client");
 	if (IS_ERR(rnbd_dev_class))
 		return PTR_ERR(rnbd_dev_class);
 

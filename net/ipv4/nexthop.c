@@ -1124,13 +1124,13 @@ static bool ipv6_good_nh(const struct fib6_nh *nh)
 	int state = NUD_REACHABLE;
 	struct neighbour *n;
 
-	rcu_read_lock_bh();
+	rcu_read_lock();
 
 	n = __ipv6_neigh_lookup_noref_stub(nh->fib_nh_dev, &nh->fib_nh_gw6);
 	if (n)
-		state = n->nud_state;
+		state = READ_ONCE(n->nud_state);
 
-	rcu_read_unlock_bh();
+	rcu_read_unlock();
 
 	return !!(state & NUD_VALID);
 }
@@ -1140,14 +1140,14 @@ static bool ipv4_good_nh(const struct fib_nh *nh)
 	int state = NUD_REACHABLE;
 	struct neighbour *n;
 
-	rcu_read_lock_bh();
+	rcu_read_lock();
 
 	n = __ipv4_neigh_lookup_noref(nh->fib_nh_dev,
 				      (__force u32)nh->fib_nh_gw4);
 	if (n)
-		state = n->nud_state;
+		state = READ_ONCE(n->nud_state);
 
-	rcu_read_unlock_bh();
+	rcu_read_unlock();
 
 	return !!(state & NUD_VALID);
 }
@@ -1858,7 +1858,7 @@ static void __remove_nexthop_fib(struct net *net, struct nexthop *nh)
 		/* __ip6_del_rt does a release, so do a hold here */
 		fib6_info_hold(f6i);
 		ipv6_stub->ip6_del_rt(net, f6i,
-				      !net->ipv4.sysctl_nexthop_compat_mode);
+				      !READ_ONCE(net->ipv4.sysctl_nexthop_compat_mode));
 	}
 }
 
@@ -2361,7 +2361,8 @@ out:
 	if (!rc) {
 		nh_base_seq_inc(net);
 		nexthop_notify(RTM_NEWNEXTHOP, new_nh, &cfg->nlinfo);
-		if (replace_notify && net->ipv4.sysctl_nexthop_compat_mode)
+		if (replace_notify &&
+		    READ_ONCE(net->ipv4.sysctl_nexthop_compat_mode))
 			nexthop_replace_notify(net, new_nh, &cfg->nlinfo);
 	}
 
@@ -2533,7 +2534,7 @@ static int nh_create_ipv4(struct net *net, struct nexthop *nh,
 	if (!err) {
 		nh->nh_flags = fib_nh->fib_nh_flags;
 		fib_info_update_nhc_saddr(net, &fib_nh->nh_common,
-					  fib_nh->fib_nh_scope);
+					  !fib_nh->fib_nh_scope ? 0 : fib_nh->fib_nh_scope - 1);
 	} else {
 		fib_nh_release(net, fib_nh);
 	}
@@ -3733,12 +3734,16 @@ out:
 }
 EXPORT_SYMBOL(nexthop_res_grp_activity_update);
 
-static void __net_exit nexthop_net_exit(struct net *net)
+static void __net_exit nexthop_net_exit_batch(struct list_head *net_list)
 {
+	struct net *net;
+
 	rtnl_lock();
-	flush_all_nexthops(net);
+	list_for_each_entry(net, net_list, exit_list) {
+		flush_all_nexthops(net);
+		kfree(net->nexthop.devhash);
+	}
 	rtnl_unlock();
-	kfree(net->nexthop.devhash);
 }
 
 static int __net_init nexthop_net_init(struct net *net)
@@ -3756,7 +3761,7 @@ static int __net_init nexthop_net_init(struct net *net)
 
 static struct pernet_operations nexthop_net_ops = {
 	.init = nexthop_net_init,
-	.exit = nexthop_net_exit,
+	.exit_batch = nexthop_net_exit_batch,
 };
 
 static int __init nexthop_init(void)

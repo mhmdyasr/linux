@@ -350,6 +350,8 @@ static int hidraw_release(struct inode * inode, struct file * file)
 	down_write(&minors_rwsem);
 
 	spin_lock_irqsave(&hidraw_table[minor]->list_lock, flags);
+	for (int i = list->tail; i < list->head; i++)
+		kfree(list->buffer[i].value);
 	list_del(&list->node);
 	spin_unlock_irqrestore(&hidraw_table[minor]->list_lock, flags);
 	kfree(list);
@@ -616,7 +618,7 @@ int __init hidraw_init(void)
 
 	hidraw_major = MAJOR(dev_id);
 
-	hidraw_class = class_create(THIS_MODULE, "hidraw");
+	hidraw_class = class_create("hidraw");
 	if (IS_ERR(hidraw_class)) {
 		result = PTR_ERR(hidraw_class);
 		goto error_cdev;

@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
  * Copyright (C) 2016-2017 Intel Deutschland GmbH
- * Copyright (C) 2018-2020 Intel Corporation
+ * Copyright (C) 2018-2022 Intel Corporation
  */
 #ifndef __iwl_fw_api_commands_h__
 #define __iwl_fw_api_commands_h__
@@ -20,6 +20,8 @@
  *	&enum iwl_phy_ops_subcmd_ids
  * @DATA_PATH_GROUP: data path group, uses command IDs from
  *	&enum iwl_data_path_subcmd_ids
+ * @SCAN_GROUP: scan group, uses command IDs from
+ *	&enum iwl_scan_subcmd_ids
  * @NAN_GROUP: NAN group, uses command IDs from &enum iwl_nan_subcmd_ids
  * @LOCATION_GROUP: location group, uses command IDs from
  *	&enum iwl_location_subcmd_ids
@@ -36,6 +38,7 @@ enum iwl_mvm_command_groups {
 	MAC_CONF_GROUP = 0x3,
 	PHY_OPS_GROUP = 0x4,
 	DATA_PATH_GROUP = 0x5,
+	SCAN_GROUP = 0x6,
 	NAN_GROUP = 0x7,
 	LOCATION_GROUP = 0x8,
 	PROT_OFFLOAD_GROUP = 0xb,
@@ -150,6 +153,7 @@ enum iwl_legacy_cmds {
 
 	/**
 	 * @TXPATH_FLUSH: &struct iwl_tx_path_flush_cmd
+	 *	response in &struct iwl_tx_path_flush_cmd_rsp
 	 */
 	TXPATH_FLUSH = 0x1e,
 
@@ -262,6 +266,24 @@ enum iwl_legacy_cmds {
 	HOT_SPOT_CMD = 0x53,
 
 	/**
+	 * @WNM_80211V_TIMING_MEASUREMENT_NOTIFICATION: Time Sync
+	 *	measurement notification for TM/FTM. Sent on receipt of
+	 *	respective WNM action frame for TM protocol or public action
+	 *	frame for FTM protocol from peer device along with additional
+	 *	meta data specified in &struct iwl_time_msmt_notify
+	 */
+	WNM_80211V_TIMING_MEASUREMENT_NOTIFICATION = 0x67,
+
+	/**
+	 * @WNM_80211V_TIMING_MEASUREMENT_CONFIRM_NOTIFICATION: Time Sync
+	 *	measurement confirmation notification for TM/FTM. Sent on
+	 *	receipt of Ack from peer for previously Tx'ed TM/FTM
+	 *	action frame along with additional meta data specified in
+	 *	&struct iwl_time_msmt_cfm_notify
+	 */
+	WNM_80211V_TIMING_MEASUREMENT_CONFIRM_NOTIFICATION = 0x68,
+
+	/**
 	 * @SCAN_OFFLOAD_COMPLETE:
 	 * notification, &struct iwl_periodic_scan_complete
 	 */
@@ -321,14 +343,6 @@ enum iwl_legacy_cmds {
 	 * Thermal throttling command
 	 */
 	REPLY_THERMAL_MNG_BACKOFF = 0x7e,
-
-	/**
-	 * @DC2DC_CONFIG_CMD:
-	 * Set/Get DC2DC frequency tune
-	 * Command is &struct iwl_dc2dc_config_cmd,
-	 * response is &struct iwl_dc2dc_config_resp
-	 */
-	DC2DC_CONFIG_CMD = 0x83,
 
 	/**
 	 * @NVM_ACCESS_CMD: using &struct iwl_nvm_access_cmd
@@ -502,11 +516,6 @@ enum iwl_legacy_cmds {
 	DEBUG_LOG_MSG = 0xf7,
 
 	/**
-	 * @BCAST_FILTER_CMD: &struct iwl_bcast_filter_cmd
-	 */
-	BCAST_FILTER_CMD = 0xcf,
-
-	/**
 	 * @MCAST_FILTER_CMD: &struct iwl_mcast_filter_cmd
 	 */
 	MCAST_FILTER_CMD = 0xd0,
@@ -613,6 +622,11 @@ enum iwl_system_subcmd_ids {
 	 * @SYSTEM_FEATURES_CONTROL_CMD: &struct iwl_system_features_control_cmd
 	 */
 	SYSTEM_FEATURES_CONTROL_CMD = 0xd,
+
+	/**
+	 * @RFI_DEACTIVATE_NOTIF: &struct iwl_rfi_deactivate_notif
+	 */
+	RFI_DEACTIVATE_NOTIF = 0xff,
 };
 
 #endif /* __iwl_fw_api_commands_h__ */

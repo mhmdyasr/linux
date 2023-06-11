@@ -6,6 +6,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/media-bus-format.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -24,6 +25,7 @@ struct display_connector {
 	int			hpd_irq;
 
 	struct regulator	*dp_pwr;
+	struct gpio_desc	*ddc_en;
 };
 
 static inline struct display_connector *
@@ -269,12 +271,9 @@ static int display_connector_probe(struct platform_device *pdev)
 	    type == DRM_MODE_CONNECTOR_DisplayPort) {
 		conn->hpd_gpio = devm_gpiod_get_optional(&pdev->dev, "hpd",
 							 GPIOD_IN);
-		if (IS_ERR(conn->hpd_gpio)) {
-			if (PTR_ERR(conn->hpd_gpio) != -EPROBE_DEFER)
-				dev_err(&pdev->dev,
-					"Unable to retrieve HPD GPIO\n");
-			return PTR_ERR(conn->hpd_gpio);
-		}
+		if (IS_ERR(conn->hpd_gpio))
+			return dev_err_probe(&pdev->dev, PTR_ERR(conn->hpd_gpio),
+					     "Unable to retrieve HPD GPIO\n");
 
 		conn->hpd_irq = gpiod_to_irq(conn->hpd_gpio);
 	} else {
@@ -345,6 +344,17 @@ static int display_connector_probe(struct platform_device *pdev)
 		}
 	}
 
+	/* enable DDC */
+	if (type == DRM_MODE_CONNECTOR_HDMIA) {
+		conn->ddc_en = devm_gpiod_get_optional(&pdev->dev, "ddc-en",
+						       GPIOD_OUT_HIGH);
+
+		if (IS_ERR(conn->ddc_en)) {
+			dev_err(&pdev->dev, "Couldn't get ddc-en gpio\n");
+			return PTR_ERR(conn->ddc_en);
+		}
+	}
+
 	conn->bridge.funcs = &display_connector_bridge_funcs;
 	conn->bridge.of_node = pdev->dev.of_node;
 
@@ -369,9 +379,12 @@ static int display_connector_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int display_connector_remove(struct platform_device *pdev)
+static void display_connector_remove(struct platform_device *pdev)
 {
 	struct display_connector *conn = platform_get_drvdata(pdev);
+
+	if (conn->ddc_en)
+		gpiod_set_value(conn->ddc_en, 0);
 
 	if (conn->dp_pwr)
 		regulator_disable(conn->dp_pwr);
@@ -380,8 +393,6 @@ static int display_connector_remove(struct platform_device *pdev)
 
 	if (!IS_ERR(conn->bridge.ddc))
 		i2c_put_adapter(conn->bridge.ddc);
-
-	return 0;
 }
 
 static const struct of_device_id display_connector_match[] = {
@@ -410,7 +421,7 @@ MODULE_DEVICE_TABLE(of, display_connector_match);
 
 static struct platform_driver display_connector_driver = {
 	.probe	= display_connector_probe,
-	.remove	= display_connector_remove,
+	.remove_new = display_connector_remove,
 	.driver		= {
 		.name		= "display-connector",
 		.of_match_table	= display_connector_match,

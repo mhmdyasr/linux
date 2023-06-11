@@ -577,7 +577,6 @@ static void octeon_destroy_resources(struct octeon_device *oct)
 
 		fallthrough;
 	case OCT_DEV_PCI_ENABLE_DONE:
-		pci_clear_master(oct->pci_dev);
 		/* Disable the device, releasing the PCI INT */
 		pci_disable_device(oct->pci_dev);
 
@@ -2094,7 +2093,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
 				      | NETIF_F_TSO | NETIF_F_TSO6
 				      | NETIF_F_GRO
 				      | NETIF_F_LRO;
-		netif_set_gso_max_size(netdev, OCTNIC_GSO_MAX_SIZE);
+		netif_set_tso_max_size(netdev, OCTNIC_GSO_MAX_SIZE);
 
 		/* Copy of transmit encapsulation capabilities:
 		 * TSO, TSO6, Checksums for this device

@@ -23,6 +23,13 @@ properties:
   backlight: true
   port: true
 
+  spi-cpha: true
+  spi-cpol: true
+
+  dc-gpios:
+    maxItems: 1
+    description: DCX pin, Display data/command selection pin in parallel interface
+
 required:
   - compatible
   - reg

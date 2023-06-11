@@ -31,22 +31,28 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 {
 	int r;
 
-	r = kvm_riscv_stage2_alloc_pgd(kvm);
+	r = kvm_riscv_gstage_alloc_pgd(kvm);
 	if (r)
 		return r;
 
-	r = kvm_riscv_stage2_vmid_init(kvm);
+	r = kvm_riscv_gstage_vmid_init(kvm);
 	if (r) {
-		kvm_riscv_stage2_free_pgd(kvm);
+		kvm_riscv_gstage_free_pgd(kvm);
 		return r;
 	}
 
-	return kvm_riscv_guest_timer_init(kvm);
+	kvm_riscv_aia_init_vm(kvm);
+
+	kvm_riscv_guest_timer_init(kvm);
+
+	return 0;
 }
 
 void kvm_arch_destroy_vm(struct kvm *kvm)
 {
 	kvm_destroy_vcpus(kvm);
+
+	kvm_riscv_aia_destroy_vm(kvm);
 }
 
 int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
@@ -75,7 +81,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		r = KVM_USER_MEM_SLOTS;
 		break;
 	case KVM_CAP_VM_GPA_BITS:
-		r = kvm_riscv_stage2_gpa_bits();
+		r = kvm_riscv_gstage_gpa_bits();
 		break;
 	default:
 		r = 0;
@@ -85,8 +91,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	return r;
 }
 
-long kvm_arch_vm_ioctl(struct file *filp,
-		       unsigned int ioctl, unsigned long arg)
+int kvm_arch_vm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
 	return -EINVAL;
 }

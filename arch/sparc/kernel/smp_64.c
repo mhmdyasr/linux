@@ -1186,12 +1186,6 @@ void __irq_entry smp_penguin_jailcell(int irq, struct pt_regs *regs)
 	preempt_enable();
 }
 
-/* /proc/profile writes can call this, don't __init it please. */
-int setup_profiling_timer(unsigned int multiplier)
-{
-	return -EINVAL;
-}
-
 void __init smp_prepare_cpus(unsigned int max_cpus)
 {
 }
@@ -1436,7 +1430,7 @@ static unsigned long send_cpu_poke(int cpu)
 	return hv_err;
 }
 
-void smp_send_reschedule(int cpu)
+void arch_smp_send_reschedule(int cpu)
 {
 	if (cpu == smp_processor_id()) {
 		WARN_ON_ONCE(preemptible());

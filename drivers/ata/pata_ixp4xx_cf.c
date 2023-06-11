@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/libata.h>
 #include <linux/irq.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <scsi/scsi_host.h>
@@ -173,7 +174,7 @@ static unsigned int ixp4xx_mmio_data_xfer(struct ata_queued_cmd *qc,
 	return words << 1;
 }
 
-static struct scsi_host_template ixp4xx_sht = {
+static const struct scsi_host_template ixp4xx_sht = {
 	ATA_PIO_SHT(DRV_NAME),
 };
 
@@ -293,7 +294,7 @@ static int ixp4xx_pata_probe(struct platform_device *pdev)
 
 static const struct of_device_id ixp4xx_pata_of_match[] = {
 	{ .compatible = "intel,ixp4xx-compact-flash", },
-	{ },
+	{ /* sentinel */ }
 };
 
 static struct platform_driver ixp4xx_pata_platform_driver = {

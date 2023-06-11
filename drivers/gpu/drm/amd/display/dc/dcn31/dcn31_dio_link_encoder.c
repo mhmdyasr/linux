@@ -30,7 +30,6 @@
 #include "link_encoder.h"
 #include "dcn31_dio_link_encoder.h"
 #include "stream_encoder.h"
-#include "i2caux_interface.h"
 #include "dc_bios_types.h"
 
 #include "gpio_service_interface.h"
@@ -38,6 +37,7 @@
 #include "link_enc_cfg.h"
 #include "dc_dmub_srv.h"
 #include "dal_asic_id.h"
+#include "link.h"
 
 #define CTX \
 	enc10->base.ctx
@@ -103,6 +103,9 @@ static uint8_t phy_id_from_transmitter(enum transmitter t)
 static bool has_query_dp_alt(struct link_encoder *enc)
 {
 	struct dc_dmub_srv *dc_dmub_srv = enc->ctx->dmub_srv;
+
+	if (enc->ctx->dce_version >= DCN_VERSION_3_15)
+		return true;
 
 	/* Supports development firmware and firmware >= 4.0.11 */
 	return dc_dmub_srv &&
@@ -230,9 +233,7 @@ static void enc31_hw_init(struct link_encoder *enc)
 	AUX_RX_PHASE_DETECT_LEN,  [21,20] = 0x3 default is 3
 	AUX_RX_DETECTION_THRESHOLD [30:28] = 1
 */
-	AUX_REG_WRITE(AUX_DPHY_RX_CONTROL0, 0x103d1110);
-
-	AUX_REG_WRITE(AUX_DPHY_TX_CONTROL, 0x21c7a);
+	// dmub will read AUX_DPHY_RX_CONTROL0/AUX_DPHY_TX_CONTROL from vbios table in dp_aux_init
 
 	//AUX_DPHY_TX_REF_CONTROL'AUX_TX_REF_DIV HW default is 0x32;
 	// Set AUX_TX_REF_DIV Divider to generate 2 MHz reference from refclk
@@ -240,17 +241,8 @@ static void enc31_hw_init(struct link_encoder *enc)
 	// 100MHz -> 0x32
 	// 48MHz -> 0x18
 
-#ifdef CLEANUP_FIXME
-	/*from display_init*/
-	REG_WRITE(RDPCSTX_DEBUG_CONFIG, 0);
-#endif
-
 	// Set TMDS_CTL0 to 1.  This is a legacy setting.
 	REG_UPDATE(TMDS_CTL_BITS, TMDS_CTL0, 1);
-
-	/*HW default is 5*/
-	REG_UPDATE(RDPCSTX_CNTL,
-			RDPCS_TX_FIFO_RD_START_DELAY, 4);
 
 	dcn10_aux_initialize(enc10);
 }
@@ -469,6 +461,7 @@ void dcn31_link_encoder_enable_dp_output(
 	/* Enable transmitter and encoder. */
 	if (!link_enc_cfg_is_transmitter_mappable(enc->ctx->dc, enc)) {
 
+		DC_LOG_DEBUG("%s: enc_id(%d)\n", __func__, enc->preferred_engine);
 		dcn20_link_encoder_enable_dp_output(enc, link_settings, clock_source);
 
 	} else {
@@ -493,13 +486,14 @@ void dcn31_link_encoder_enable_dp_output(
 
 		if (link) {
 			dpia_control.dpia_id = link->ddc_hw_inst;
-			dpia_control.fec_rdy = dc_link_should_enable_fec(link);
+			dpia_control.fec_rdy = link->dc->link_srv->dp_should_enable_fec(link);
 		} else {
 			DC_LOG_ERROR("%s: Failed to execute DPIA enable DMUB command.\n", __func__);
 			BREAK_TO_DEBUGGER();
 			return;
 		}
 
+		DC_LOG_DEBUG("%s: DPIA(%d) - enc_id(%d)\n", __func__, dpia_control.dpia_id, dpia_control.enc_id);
 		link_dpia_control(enc->ctx, &dpia_control);
 	}
 }
@@ -514,6 +508,7 @@ void dcn31_link_encoder_enable_dp_mst_output(
 	/* Enable transmitter and encoder. */
 	if (!link_enc_cfg_is_transmitter_mappable(enc->ctx->dc, enc)) {
 
+		DC_LOG_DEBUG("%s: enc_id(%d)\n", __func__, enc->preferred_engine);
 		dcn10_link_encoder_enable_dp_mst_output(enc, link_settings, clock_source);
 
 	} else {
@@ -538,13 +533,14 @@ void dcn31_link_encoder_enable_dp_mst_output(
 
 		if (link) {
 			dpia_control.dpia_id = link->ddc_hw_inst;
-			dpia_control.fec_rdy = dc_link_should_enable_fec(link);
+			dpia_control.fec_rdy = link->dc->link_srv->dp_should_enable_fec(link);
 		} else {
 			DC_LOG_ERROR("%s: Failed to execute DPIA enable DMUB command.\n", __func__);
 			BREAK_TO_DEBUGGER();
 			return;
 		}
 
+		DC_LOG_DEBUG("%s: DPIA(%d) - enc_id(%d)\n", __func__, dpia_control.dpia_id, dpia_control.enc_id);
 		link_dpia_control(enc->ctx, &dpia_control);
 	}
 }
@@ -558,6 +554,7 @@ void dcn31_link_encoder_disable_output(
 	/* Disable transmitter and encoder. */
 	if (!link_enc_cfg_is_transmitter_mappable(enc->ctx->dc, enc)) {
 
+		DC_LOG_DEBUG("%s: enc_id(%d)\n", __func__, enc->preferred_engine);
 		dcn10_link_encoder_disable_output(enc, signal);
 
 	} else {
@@ -589,6 +586,7 @@ void dcn31_link_encoder_disable_output(
 			return;
 		}
 
+		DC_LOG_DEBUG("%s: DPIA(%d) - enc_id(%d)\n", __func__, dpia_control.dpia_id, dpia_control.enc_id);
 		link_dpia_control(enc->ctx, &dpia_control);
 
 		link_encoder_disable(enc10);

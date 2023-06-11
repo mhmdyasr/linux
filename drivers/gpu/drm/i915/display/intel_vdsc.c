@@ -7,13 +7,17 @@
  */
 #include <linux/limits.h>
 
+#include <drm/display/drm_dsc_helper.h>
+
 #include "i915_drv.h"
+#include "i915_reg.h"
 #include "intel_crtc.h"
 #include "intel_de.h"
 #include "intel_display_types.h"
 #include "intel_dsi.h"
 #include "intel_qp_tables.h"
 #include "intel_vdsc.h"
+#include "intel_vdsc_regs.h"
 
 enum ROW_INDEX_BPP {
 	ROW_INDEX_6BPP = 0,
@@ -341,22 +345,14 @@ bool intel_dsc_source_support(const struct intel_crtc_state *crtc_state)
 	const struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
 	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
 	enum transcoder cpu_transcoder = crtc_state->cpu_transcoder;
-	enum pipe pipe = crtc->pipe;
 
-	if (!INTEL_INFO(i915)->display.has_dsc)
+	if (!HAS_DSC(i915))
 		return false;
 
-	/* On TGL, DSC is supported on all Pipes */
-	if (DISPLAY_VER(i915) >= 12)
-		return true;
+	if (DISPLAY_VER(i915) == 11 && cpu_transcoder == TRANSCODER_A)
+		return false;
 
-	if (DISPLAY_VER(i915) >= 11 &&
-	    (pipe != PIPE_A || cpu_transcoder == TRANSCODER_EDP ||
-	     cpu_transcoder == TRANSCODER_DSI_0 ||
-	     cpu_transcoder == TRANSCODER_DSI_1))
-		return true;
-
-	return false;
+	return true;
 }
 
 static bool is_pipe_dsc(struct intel_crtc *crtc, enum transcoder cpu_transcoder)
@@ -383,10 +379,18 @@ calculate_rc_params(struct rc_parameters *rc,
 {
 	int bpc = vdsc_cfg->bits_per_component;
 	int bpp = vdsc_cfg->bits_per_pixel >> 4;
-	int ofs_und6[] = { 0, -2, -2, -4, -6, -6, -8, -8, -8, -10, -10, -12, -12, -12, -12 };
-	int ofs_und8[] = { 2, 0, 0, -2, -4, -6, -8, -8, -8, -10, -10, -10, -12, -12, -12 };
-	int ofs_und12[] = { 2, 0, 0, -2, -4, -6, -8, -8, -8, -10, -10, -10, -12, -12, -12 };
-	int ofs_und15[] = { 10, 8, 6, 4, 2, 0, -2, -4, -6, -8, -10, -10, -12, -12, -12 };
+	static const s8 ofs_und6[] = {
+		0, -2, -2, -4, -6, -6, -8, -8, -8, -10, -10, -12, -12, -12, -12
+	};
+	static const s8 ofs_und8[] = {
+		2, 0, 0, -2, -4, -6, -8, -8, -8, -10, -10, -10, -12, -12, -12
+	};
+	static const s8 ofs_und12[] = {
+		2, 0, 0, -2, -4, -6, -8, -8, -8, -10, -10, -10, -12, -12, -12
+	};
+	static const s8 ofs_und15[] = {
+		10, 8, 6, 4, 2, 0, -2, -4, -6, -8, -10, -10, -12, -12, -12
+	};
 	int qp_bpc_modifier = (bpc - 8) * 2;
 	u32 res, buf_i, bpp_i;
 
@@ -419,9 +423,9 @@ calculate_rc_params(struct rc_parameters *rc,
 	for (buf_i = 0; buf_i < DSC_NUM_BUF_RANGES; buf_i++) {
 		/* Read range_minqp and range_max_qp from qp tables */
 		rc->rc_range_params[buf_i].range_min_qp =
-			intel_lookup_range_min_qp(bpc, buf_i, bpp_i);
+			intel_lookup_range_min_qp(bpc, buf_i, bpp_i, vdsc_cfg->native_420);
 		rc->rc_range_params[buf_i].range_max_qp =
-			intel_lookup_range_max_qp(bpc, buf_i, bpp_i);
+			intel_lookup_range_max_qp(bpc, buf_i, bpp_i, vdsc_cfg->native_420);
 
 		/* Calculate range_bgp_offset */
 		if (bpp <= 6) {
@@ -444,6 +448,29 @@ calculate_rc_params(struct rc_parameters *rc,
 	}
 }
 
+static int intel_dsc_slice_dimensions_valid(struct intel_crtc_state *pipe_config,
+					    struct drm_dsc_config *vdsc_cfg)
+{
+	if (pipe_config->output_format == INTEL_OUTPUT_FORMAT_RGB ||
+	    pipe_config->output_format == INTEL_OUTPUT_FORMAT_YCBCR444) {
+		if (vdsc_cfg->slice_height > 4095)
+			return -EINVAL;
+		if (vdsc_cfg->slice_height * vdsc_cfg->slice_width < 15000)
+			return -EINVAL;
+	} else if (pipe_config->output_format == INTEL_OUTPUT_FORMAT_YCBCR420) {
+		if (vdsc_cfg->slice_width % 2)
+			return -EINVAL;
+		if (vdsc_cfg->slice_height % 2)
+			return -EINVAL;
+		if (vdsc_cfg->slice_height > 4094)
+			return -EINVAL;
+		if (vdsc_cfg->slice_height * vdsc_cfg->slice_width < 30000)
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
 int intel_dsc_compute_params(struct intel_crtc_state *pipe_config)
 {
 	struct intel_crtc *crtc = to_intel_crtc(pipe_config->uapi.crtc);
@@ -452,20 +479,64 @@ int intel_dsc_compute_params(struct intel_crtc_state *pipe_config)
 	u16 compressed_bpp = pipe_config->dsc.compressed_bpp;
 	const struct rc_parameters *rc_params;
 	struct rc_parameters *rc = NULL;
+	int err;
 	u8 i = 0;
 
 	vdsc_cfg->pic_width = pipe_config->hw.adjusted_mode.crtc_hdisplay;
-	vdsc_cfg->pic_height = pipe_config->hw.adjusted_mode.crtc_vdisplay;
 	vdsc_cfg->slice_width = DIV_ROUND_UP(vdsc_cfg->pic_width,
 					     pipe_config->dsc.slice_count);
 
-	/* Gen 11 does not support YCbCr */
+	err = intel_dsc_slice_dimensions_valid(pipe_config, vdsc_cfg);
+
+	if (err) {
+		drm_dbg_kms(&dev_priv->drm, "Slice dimension requirements not met\n");
+		return err;
+	}
+
+	/*
+	 * According to DSC 1.2 specs if colorspace is YCbCr then convert_rgb is 0
+	 * else 1
+	 */
+	vdsc_cfg->convert_rgb = pipe_config->output_format != INTEL_OUTPUT_FORMAT_YCBCR420 &&
+				pipe_config->output_format != INTEL_OUTPUT_FORMAT_YCBCR444;
+
+	if (DISPLAY_VER(dev_priv) >= 14 &&
+	    pipe_config->output_format == INTEL_OUTPUT_FORMAT_YCBCR420)
+		vdsc_cfg->native_420 = true;
+	/* We do not support YcBCr422 as of now */
+	vdsc_cfg->native_422 = false;
 	vdsc_cfg->simple_422 = false;
 	/* Gen 11 does not support VBR */
 	vdsc_cfg->vbr_enable = false;
 
 	/* Gen 11 only supports integral values of bpp */
 	vdsc_cfg->bits_per_pixel = compressed_bpp << 4;
+
+	/*
+	 * According to DSC 1.2 specs in Section 4.1 if native_420 is set:
+	 * -We need to double the current bpp.
+	 * -second_line_bpg_offset is 12 in general and equal to 2*(slice_height-1) if slice
+	 * height < 8.
+	 * -second_line_offset_adj is 512 as shown by emperical values to yeild best chroma
+	 * preservation in second line.
+	 * -nsl_bpg_offset is calculated as second_line_offset/slice_height -1 then rounded
+	 * up to 16 fractional bits, we left shift second line offset by 11 to preserve 11
+	 * fractional bits.
+	 */
+	if (vdsc_cfg->native_420) {
+		vdsc_cfg->bits_per_pixel <<= 1;
+
+		if (vdsc_cfg->slice_height >= 8)
+			vdsc_cfg->second_line_bpg_offset = 12;
+		else
+			vdsc_cfg->second_line_bpg_offset =
+				2 * (vdsc_cfg->slice_height - 1);
+
+		vdsc_cfg->second_line_offset_adj = 512;
+		vdsc_cfg->nsl_bpg_offset = DIV_ROUND_UP(vdsc_cfg->second_line_bpg_offset << 11,
+							vdsc_cfg->slice_height - 1);
+	}
+
 	vdsc_cfg->bits_per_component = pipe_config->pipe_bpp / 3;
 
 	for (i = 0; i < DSC_NUM_BUF_RANGES - 1; i++) {
@@ -584,7 +655,7 @@ static void intel_dsc_pps_configure(const struct intel_crtc_state *crtc_state)
 	u8 num_vdsc_instances = (crtc_state->dsc.dsc_split) ? 2 : 1;
 	int i = 0;
 
-	if (crtc_state->bigjoiner)
+	if (crtc_state->bigjoiner_pipes)
 		num_vdsc_instances *= 2;
 
 	/* Populate PICTURE_PARAMETER_SET_0 registers */
@@ -592,6 +663,13 @@ static void intel_dsc_pps_configure(const struct intel_crtc_state *crtc_state)
 		DSC_VER_MIN_SHIFT |
 		vdsc_cfg->bits_per_component << DSC_BPC_SHIFT |
 		vdsc_cfg->line_buf_depth << DSC_LINE_BUF_DEPTH_SHIFT;
+	if (vdsc_cfg->dsc_version_minor == 2) {
+		pps_val |= DSC_ALT_ICH_SEL;
+		if (vdsc_cfg->native_420)
+			pps_val |= DSC_NATIVE_420_ENABLE;
+		if (vdsc_cfg->native_422)
+			pps_val |= DSC_NATIVE_422_ENABLE;
+	}
 	if (vdsc_cfg->block_pred_enable)
 		pps_val |= DSC_BLOCK_PREDICTION;
 	if (vdsc_cfg->convert_rgb)
@@ -902,6 +980,33 @@ static void intel_dsc_pps_configure(const struct intel_crtc_state *crtc_state)
 				       pps_val);
 	}
 
+	if (DISPLAY_VER(dev_priv) >= 14) {
+		/* Populate PICTURE_PARAMETER_SET_17 registers */
+		pps_val = 0;
+		pps_val |= DSC_SL_BPG_OFFSET(vdsc_cfg->second_line_bpg_offset);
+		drm_dbg_kms(&dev_priv->drm, "PPS17 = 0x%08x\n", pps_val);
+		intel_de_write(dev_priv,
+			       MTL_DSC0_PICTURE_PARAMETER_SET_17(pipe),
+			       pps_val);
+		if (crtc_state->dsc.dsc_split)
+			intel_de_write(dev_priv,
+				       MTL_DSC1_PICTURE_PARAMETER_SET_17(pipe),
+				       pps_val);
+
+		/* Populate PICTURE_PARAMETER_SET_18 registers */
+		pps_val = 0;
+		pps_val |= DSC_NSL_BPG_OFFSET(vdsc_cfg->nsl_bpg_offset) |
+			   DSC_SL_OFFSET_ADJ(vdsc_cfg->second_line_offset_adj);
+		drm_dbg_kms(&dev_priv->drm, "PPS18 = 0x%08x\n", pps_val);
+		intel_de_write(dev_priv,
+			       MTL_DSC0_PICTURE_PARAMETER_SET_18(pipe),
+			       pps_val);
+		if (crtc_state->dsc.dsc_split)
+			intel_de_write(dev_priv,
+				       MTL_DSC1_PICTURE_PARAMETER_SET_18(pipe),
+				       pps_val);
+	}
+
 	/* Populate the RC_BUF_THRESH registers */
 	memset(rc_buf_thresh_dword, 0, sizeof(rc_buf_thresh_dword));
 	for (i = 0; i < DSC_NUM_BUF_RANGES - 1; i++) {
@@ -1112,26 +1217,14 @@ static i915_reg_t dss_ctl2_reg(struct intel_crtc *crtc, enum transcoder cpu_tran
 		ICL_PIPE_DSS_CTL2(crtc->pipe) : DSS_CTL2;
 }
 
-struct intel_crtc *
-intel_dsc_get_bigjoiner_secondary(const struct intel_crtc *primary_crtc)
-{
-	return intel_crtc_for_pipe(to_i915(primary_crtc->base.dev), primary_crtc->pipe + 1);
-}
-
-static struct intel_crtc *
-intel_dsc_get_bigjoiner_primary(const struct intel_crtc *secondary_crtc)
-{
-	return intel_crtc_for_pipe(to_i915(secondary_crtc->base.dev), secondary_crtc->pipe - 1);
-}
-
 void intel_uncompressed_joiner_enable(const struct intel_crtc_state *crtc_state)
 {
 	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
 	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
 	u32 dss_ctl1_val = 0;
 
-	if (crtc_state->bigjoiner && !crtc_state->dsc.compression_enable) {
-		if (crtc_state->bigjoiner_slave)
+	if (crtc_state->bigjoiner_pipes && !crtc_state->dsc.compression_enable) {
+		if (intel_crtc_is_bigjoiner_slave(crtc_state))
 			dss_ctl1_val |= UNCOMPRESSED_JOINER_SLAVE;
 		else
 			dss_ctl1_val |= UNCOMPRESSED_JOINER_MASTER;
@@ -1157,9 +1250,9 @@ void intel_dsc_enable(const struct intel_crtc_state *crtc_state)
 		dss_ctl2_val |= RIGHT_BRANCH_VDSC_ENABLE;
 		dss_ctl1_val |= JOINER_ENABLE;
 	}
-	if (crtc_state->bigjoiner) {
+	if (crtc_state->bigjoiner_pipes) {
 		dss_ctl1_val |= BIG_JOINER_ENABLE;
-		if (!crtc_state->bigjoiner_slave)
+		if (!intel_crtc_is_bigjoiner_slave(crtc_state))
 			dss_ctl1_val |= MASTER_BIG_JOINER_ENABLE;
 	}
 	intel_de_write(dev_priv, dss_ctl1_reg(crtc, crtc_state->cpu_transcoder), dss_ctl1_val);
@@ -1173,28 +1266,9 @@ void intel_dsc_disable(const struct intel_crtc_state *old_crtc_state)
 
 	/* Disable only if either of them is enabled */
 	if (old_crtc_state->dsc.compression_enable ||
-	    old_crtc_state->bigjoiner) {
+	    old_crtc_state->bigjoiner_pipes) {
 		intel_de_write(dev_priv, dss_ctl1_reg(crtc, old_crtc_state->cpu_transcoder), 0);
 		intel_de_write(dev_priv, dss_ctl2_reg(crtc, old_crtc_state->cpu_transcoder), 0);
-	}
-}
-
-void intel_uncompressed_joiner_get_config(struct intel_crtc_state *crtc_state)
-{
-	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
-	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
-	u32 dss_ctl1;
-
-	dss_ctl1 = intel_de_read(dev_priv, dss_ctl1_reg(crtc, crtc_state->cpu_transcoder));
-	if (dss_ctl1 & UNCOMPRESSED_JOINER_MASTER) {
-		crtc_state->bigjoiner = true;
-		crtc_state->bigjoiner_linked_crtc = intel_dsc_get_bigjoiner_secondary(crtc);
-		drm_WARN_ON(&dev_priv->drm, !crtc_state->bigjoiner_linked_crtc);
-	} else if (dss_ctl1 & UNCOMPRESSED_JOINER_SLAVE) {
-		crtc_state->bigjoiner = true;
-		crtc_state->bigjoiner_slave = true;
-		crtc_state->bigjoiner_linked_crtc = intel_dsc_get_bigjoiner_primary(crtc);
-		drm_WARN_ON(&dev_priv->drm, !crtc_state->bigjoiner_linked_crtc);
 	}
 }
 
@@ -1207,7 +1281,7 @@ void intel_dsc_get_config(struct intel_crtc_state *crtc_state)
 	enum pipe pipe = crtc->pipe;
 	enum intel_display_power_domain power_domain;
 	intel_wakeref_t wakeref;
-	u32 dss_ctl1, dss_ctl2, val;
+	u32 dss_ctl1, dss_ctl2, pps0 = 0, pps1 = 0;
 
 	if (!intel_dsc_source_support(crtc_state))
 		return;
@@ -1228,27 +1302,23 @@ void intel_dsc_get_config(struct intel_crtc_state *crtc_state)
 	crtc_state->dsc.dsc_split = (dss_ctl2 & RIGHT_BRANCH_VDSC_ENABLE) &&
 		(dss_ctl1 & JOINER_ENABLE);
 
-	if (dss_ctl1 & BIG_JOINER_ENABLE) {
-		crtc_state->bigjoiner = true;
-
-		if (!(dss_ctl1 & MASTER_BIG_JOINER_ENABLE)) {
-			crtc_state->bigjoiner_slave = true;
-			crtc_state->bigjoiner_linked_crtc = intel_dsc_get_bigjoiner_primary(crtc);
-		} else {
-			crtc_state->bigjoiner_linked_crtc = intel_dsc_get_bigjoiner_secondary(crtc);
-		}
-		drm_WARN_ON(&dev_priv->drm, !crtc_state->bigjoiner_linked_crtc);
-	}
-
 	/* FIXME: add more state readout as needed */
 
-	/* PPS1 */
-	if (!is_pipe_dsc(crtc, cpu_transcoder))
-		val = intel_de_read(dev_priv, DSCA_PICTURE_PARAMETER_SET_1);
-	else
-		val = intel_de_read(dev_priv,
-				    ICL_DSC0_PICTURE_PARAMETER_SET_1(pipe));
-	vdsc_cfg->bits_per_pixel = val;
+	/* PPS0 & PPS1 */
+	if (!is_pipe_dsc(crtc, cpu_transcoder)) {
+		pps1 = intel_de_read(dev_priv, DSCA_PICTURE_PARAMETER_SET_1);
+	} else {
+		pps0 = intel_de_read(dev_priv,
+				     ICL_DSC0_PICTURE_PARAMETER_SET_0(pipe));
+		pps1 = intel_de_read(dev_priv,
+				     ICL_DSC0_PICTURE_PARAMETER_SET_1(pipe));
+	}
+
+	vdsc_cfg->bits_per_pixel = pps1;
+
+	if (pps0 & DSC_NATIVE_420_ENABLE)
+		vdsc_cfg->bits_per_pixel >>= 1;
+
 	crtc_state->dsc.compressed_bpp = vdsc_cfg->bits_per_pixel >> 4;
 out:
 	intel_display_power_put(dev_priv, power_domain, wakeref);

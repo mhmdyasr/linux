@@ -74,7 +74,7 @@
 #define MIN_DISP_CLK_KHZ 100000
 #define MIN_DPP_CLK_KHZ 100000
 
-struct _vcs_dpi_ip_params_st dcn201_ip = {
+static struct _vcs_dpi_ip_params_st dcn201_ip = {
 	.gpuvm_enable = 0,
 	.hostvm_enable = 0,
 	.gpuvm_max_page_table_levels = 4,
@@ -136,7 +136,7 @@ struct _vcs_dpi_ip_params_st dcn201_ip = {
 	.number_of_cursors = 1,
 };
 
-struct _vcs_dpi_soc_bounding_box_st dcn201_soc = {
+static struct _vcs_dpi_soc_bounding_box_st dcn201_soc = {
 	.clock_limits = {
 			{
 				.state = 0,
@@ -571,8 +571,6 @@ static const struct resource_caps res_cap_dnc201 = {
 
 static const struct dc_plane_cap plane_cap = {
 	.type = DC_PLANE_TYPE_DCN_UNIVERSAL,
-	.blends_with_above = true,
-	.blends_with_below = true,
 	.per_pixel_alpha = true,
 
 	.pixel_format_support = {
@@ -788,6 +786,7 @@ static const struct encoder_feature_support link_enc_feature = {
 };
 
 static struct link_encoder *dcn201_link_encoder_create(
+	struct dc_context *ctx,
 	const struct encoder_init_data *enc_init_data)
 {
 	struct dcn20_link_encoder *enc20 =
@@ -1036,6 +1035,14 @@ static bool dcn201_get_dcc_compression_cap(const struct dc *dc,
 			output);
 }
 
+static void dcn201_populate_dml_writeback_from_context(struct dc *dc,
+						       struct resource_context *res_ctx,
+						       display_e2e_pipe_params_st *pipes)
+{
+	DC_FP_START();
+	dcn201_populate_dml_writeback_from_context_fpu(dc, res_ctx, pipes);
+	DC_FP_END();
+}
 
 static void dcn201_destroy_resource_pool(struct resource_pool **pool)
 {
@@ -1067,8 +1074,8 @@ static struct resource_funcs dcn201_res_pool_funcs = {
 	.add_dsc_to_stream_resource = NULL,
 	.remove_stream_from_ctx = dcn20_remove_stream_from_ctx,
 	.acquire_idle_pipe_for_layer = dcn201_acquire_idle_pipe_for_layer,
+	.populate_dml_writeback_from_context = dcn201_populate_dml_writeback_from_context,
 	.patch_unknown_plane_state = dcn20_patch_unknown_plane_state,
-	.populate_dml_writeback_from_context = dcn20_populate_dml_writeback_from_context,
 	.set_mcif_arb_params = dcn20_set_mcif_arb_params,
 	.find_first_free_match_stream_enc_for_link = dcn10_find_first_free_match_stream_enc_for_link
 };

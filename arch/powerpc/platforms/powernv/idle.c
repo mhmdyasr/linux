@@ -12,7 +12,6 @@
 #include <linux/device.h>
 #include <linux/cpu.h>
 
-#include <asm/asm-prototypes.h>
 #include <asm/firmware.h>
 #include <asm/interrupt.h>
 #include <asm/machdep.h>
@@ -113,7 +112,7 @@ static int __init pnv_save_sprs_for_deep_states(void)
 			if (rc != 0)
 				return rc;
 
-			/* Only p8 needs to set extra HID regiters */
+			/* Only p8 needs to set extra HID registers */
 			if (!cpu_has_feature(CPU_FTR_ARCH_300)) {
 				uint64_t hid1_val = mfspr(SPRN_HID1);
 				uint64_t hid4_val = mfspr(SPRN_HID4);
@@ -1205,7 +1204,7 @@ static void __init pnv_arch300_idle_init(void)
 		 * The idle code does not deal with TB loss occurring
 		 * in a shallower state than SPR loss, so force it to
 		 * behave like SPRs are lost if TB is lost. POWER9 would
-		 * never encouter this, but a POWER8 core would if it
+		 * never encounter this, but a POWER8 core would if it
 		 * implemented the stop instruction. So this is for forward
 		 * compatibility.
 		 */
@@ -1412,7 +1411,7 @@ static int __init pnv_parse_cpuidle_dt(void)
 		goto out;
 	}
 	for (i = 0; i < nr_idle_states; i++)
-		strlcpy(pnv_idle_states[i].name, temp_string[i],
+		strscpy(pnv_idle_states[i].name, temp_string[i],
 			PNV_IDLE_NAME_LEN);
 	nr_pnv_idle_states = nr_idle_states;
 	rc = 0;
@@ -1420,6 +1419,7 @@ out:
 	kfree(temp_u32);
 	kfree(temp_u64);
 	kfree(temp_string);
+	of_node_put(np);
 	return rc;
 }
 
@@ -1464,14 +1464,19 @@ static int __init pnv_init_idle_states(void)
 			power7_fastsleep_workaround_entry = false;
 			power7_fastsleep_workaround_exit = false;
 		} else {
+			struct device *dev_root;
 			/*
 			 * OPAL_PM_SLEEP_ENABLED_ER1 is set. It indicates that
 			 * workaround is needed to use fastsleep. Provide sysfs
 			 * control to choose how this workaround has to be
 			 * applied.
 			 */
-			device_create_file(cpu_subsys.dev_root,
-				&dev_attr_fastsleep_workaround_applyonce);
+			dev_root = bus_get_dev_root(&cpu_subsys);
+			if (dev_root) {
+				device_create_file(dev_root,
+						   &dev_attr_fastsleep_workaround_applyonce);
+				put_device(dev_root);
+			}
 		}
 
 		update_subcore_sibling_mask();

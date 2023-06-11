@@ -308,7 +308,7 @@ static int dax_mmap(struct file *filp, struct vm_area_struct *vma)
 		return rc;
 
 	vma->vm_ops = &dax_vm_ops;
-	vma->vm_flags |= VM_HUGEPAGE;
+	vm_flags_set(vma, VM_HUGEPAGE);
 	return 0;
 }
 
@@ -346,8 +346,7 @@ static unsigned long dax_get_unmapped_area(struct file *filp,
 }
 
 static const struct address_space_operations dev_dax_aops = {
-	.set_page_dirty		= __set_page_dirty_no_writeback,
-	.invalidatepage		= noop_invalidatepage,
+	.dirty_folio	= noop_dirty_folio,
 };
 
 static int dax_open(struct inode *inode, struct file *filp)
@@ -476,8 +475,7 @@ EXPORT_SYMBOL_GPL(dev_dax_probe);
 
 static struct dax_device_driver device_dax_driver = {
 	.probe = dev_dax_probe,
-	/* all probe actions are unwound by devm, so .remove isn't necessary */
-	.match_always = 1,
+	.type = DAXDRV_DEVICE_TYPE,
 };
 
 static int __init dax_init(void)

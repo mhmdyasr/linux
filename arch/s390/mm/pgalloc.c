@@ -33,19 +33,9 @@ static struct ctl_table page_table_sysctl[] = {
 	{ }
 };
 
-static struct ctl_table page_table_sysctl_dir[] = {
-	{
-		.procname	= "vm",
-		.maxlen		= 0,
-		.mode		= 0555,
-		.child		= page_table_sysctl,
-	},
-	{ }
-};
-
 static int __init page_table_register_sysctl(void)
 {
-	return register_sysctl_table(page_table_sysctl_dir) ? 0 : -ENOMEM;
+	return register_sysctl("vm", page_table_sysctl) ? 0 : -ENOMEM;
 }
 __initcall(page_table_register_sysctl);
 
@@ -53,17 +43,17 @@ __initcall(page_table_register_sysctl);
 
 unsigned long *crst_table_alloc(struct mm_struct *mm)
 {
-	struct page *page = alloc_pages(GFP_KERNEL, 2);
+	struct page *page = alloc_pages(GFP_KERNEL, CRST_ALLOC_ORDER);
 
 	if (!page)
 		return NULL;
-	arch_set_page_dat(page, 2);
+	arch_set_page_dat(page, CRST_ALLOC_ORDER);
 	return (unsigned long *) page_to_virt(page);
 }
 
 void crst_table_free(struct mm_struct *mm, unsigned long *table)
 {
-	free_pages((unsigned long) table, 2);
+	free_pages((unsigned long)table, CRST_ALLOC_ORDER);
 }
 
 static void __crst_table_upgrade(void *arg)
@@ -143,13 +133,7 @@ err_p4d:
 
 static inline unsigned int atomic_xor_bits(atomic_t *v, unsigned int bits)
 {
-	unsigned int old, new;
-
-	do {
-		old = atomic_read(v);
-		new = old ^ bits;
-	} while (atomic_cmpxchg(v, old, new) != old);
-	return new;
+	return atomic_fetch_xor(bits, v) ^ bits;
 }
 
 #ifdef CONFIG_PGSTE
@@ -403,7 +387,7 @@ void __tlb_remove_table(void *_table)
 
 	switch (half) {
 	case 0x00U:	/* pmd, pud, or p4d */
-		free_pages((unsigned long) table, 2);
+		free_pages((unsigned long)table, CRST_ALLOC_ORDER);
 		return;
 	case 0x01U:	/* lower 2K of a 4K page table */
 	case 0x02U:	/* higher 2K of a 4K page table */

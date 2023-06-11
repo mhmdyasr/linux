@@ -4,7 +4,7 @@
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.
  */
 
-/**
+/*
  * All common (i.e. transport-independent) SLI-4 functions are implemented
  * in this file.
  */
@@ -4127,7 +4127,7 @@ sli_calc_max_qentries(struct sli4 *sli4)
 						  sli4->qinfo.count_mask[q]);
 	}
 
-	/* single, continguous DMA allocations will be called for each queue
+	/* single, contiguous DMA allocations will be called for each queue
 	 * of size (max_qentries * queue entry size); since these can be large,
 	 * check against the OS max DMA allocation size
 	 */

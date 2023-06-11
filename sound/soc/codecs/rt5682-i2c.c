@@ -118,8 +118,7 @@ static void rt5682_i2c_disable_regulators(void *data)
 	regulator_bulk_disable(ARRAY_SIZE(rt5682->supplies), rt5682->supplies);
 }
 
-static int rt5682_i2c_probe(struct i2c_client *i2c,
-		const struct i2c_device_id *id)
+static int rt5682_i2c_probe(struct i2c_client *i2c)
 {
 	struct rt5682_platform_data *pdata = dev_get_platdata(&i2c->dev);
 	struct rt5682_priv *rt5682;
@@ -268,7 +267,9 @@ static int rt5682_i2c_probe(struct i2c_client *i2c,
 		ret = devm_request_threaded_irq(&i2c->dev, i2c->irq, NULL,
 			rt5682_irq, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING
 			| IRQF_ONESHOT, "rt5682", rt5682);
-		if (ret)
+		if (!ret)
+			rt5682->irq = i2c->irq;
+		else
 			dev_err(&i2c->dev, "Failed to reguest IRQ: %d\n", ret);
 	}
 
@@ -303,11 +304,9 @@ static void rt5682_i2c_shutdown(struct i2c_client *client)
 	rt5682_reset(rt5682);
 }
 
-static int rt5682_i2c_remove(struct i2c_client *client)
+static void rt5682_i2c_remove(struct i2c_client *client)
 {
 	rt5682_i2c_shutdown(client);
-
-	return 0;
 }
 
 static const struct of_device_id rt5682_of_match[] = {
@@ -335,7 +334,7 @@ static struct i2c_driver rt5682_i2c_driver = {
 		.acpi_match_table = rt5682_acpi_match,
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
-	.probe = rt5682_i2c_probe,
+	.probe_new = rt5682_i2c_probe,
 	.remove = rt5682_i2c_remove,
 	.shutdown = rt5682_i2c_shutdown,
 	.id_table = rt5682_i2c_id,
