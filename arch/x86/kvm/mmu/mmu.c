@@ -25,6 +25,7 @@
 #include "kvm_cache_regs.h"
 #include "smm.h"
 #include "kvm_emulate.h"
+#include "page_track.h"
 #include "cpuid.h"
 #include "spte.h"
 
@@ -53,10 +54,12 @@
 #include <asm/io.h>
 #include <asm/set_memory.h>
 #include <asm/vmx.h>
-#include <asm/kvm_page_track.h>
+
 #include "trace.h"
 
 extern bool itlb_multihit_kvm_mitigation;
+
+static bool nx_hugepage_mitigation_hard_disabled;
 
 int __read_mostly nx_huge_pages = -1;
 static uint __read_mostly nx_huge_pages_recovery_period_ms;
@@ -67,12 +70,13 @@ static uint __read_mostly nx_huge_pages_recovery_ratio = 0;
 static uint __read_mostly nx_huge_pages_recovery_ratio = 60;
 #endif
 
+static int get_nx_huge_pages(char *buffer, const struct kernel_param *kp);
 static int set_nx_huge_pages(const char *val, const struct kernel_param *kp);
 static int set_nx_huge_pages_recovery_param(const char *val, const struct kernel_param *kp);
 
 static const struct kernel_param_ops nx_huge_pages_ops = {
 	.set = set_nx_huge_pages,
-	.get = param_get_bool,
+	.get = get_nx_huge_pages,
 };
 
 static const struct kernel_param_ops nx_huge_pages_recovery_param_ops = {
@@ -111,11 +115,6 @@ module_param_named(tdp_mmu, tdp_mmu_enabled, bool, 0444);
 static int max_huge_page_level __read_mostly;
 static int tdp_root_level __read_mostly;
 static int max_tdp_level __read_mostly;
-
-#ifdef MMU_DEBUG
-bool dbg = 0;
-module_param(dbg, bool, 0644);
-#endif
 
 #define PTE_PREFETCH_NUM		8
 
@@ -272,19 +271,11 @@ static inline unsigned long kvm_mmu_get_guest_pgd(struct kvm_vcpu *vcpu,
 
 static inline bool kvm_available_flush_remote_tlbs_range(void)
 {
+#if IS_ENABLED(CONFIG_HYPERV)
 	return kvm_x86_ops.flush_remote_tlbs_range;
-}
-
-void kvm_flush_remote_tlbs_range(struct kvm *kvm, gfn_t start_gfn,
-				 gfn_t nr_pages)
-{
-	int ret = -EOPNOTSUPP;
-
-	if (kvm_x86_ops.flush_remote_tlbs_range)
-		ret = static_call(kvm_x86_flush_remote_tlbs_range)(kvm, start_gfn,
-								   nr_pages);
-	if (ret)
-		kvm_flush_remote_tlbs(kvm);
+#else
+	return false;
+#endif
 }
 
 static gfn_t kvm_mmu_page_get_gfn(struct kvm_mmu_page *sp, int index);
@@ -487,7 +478,7 @@ retry:
  */
 static void mmu_spte_set(u64 *sptep, u64 new_spte)
 {
-	WARN_ON(is_shadow_present_pte(*sptep));
+	WARN_ON_ONCE(is_shadow_present_pte(*sptep));
 	__set_spte(sptep, new_spte);
 }
 
@@ -499,7 +490,7 @@ static u64 mmu_spte_update_no_track(u64 *sptep, u64 new_spte)
 {
 	u64 old_spte = *sptep;
 
-	WARN_ON(!is_shadow_present_pte(new_spte));
+	WARN_ON_ONCE(!is_shadow_present_pte(new_spte));
 	check_spte_writable_invariants(new_spte);
 
 	if (!is_shadow_present_pte(old_spte)) {
@@ -512,7 +503,7 @@ static u64 mmu_spte_update_no_track(u64 *sptep, u64 new_spte)
 	else
 		old_spte = __update_clear_spte_slow(sptep, new_spte);
 
-	WARN_ON(spte_to_pfn(old_spte) != spte_to_pfn(new_spte));
+	WARN_ON_ONCE(spte_to_pfn(old_spte) != spte_to_pfn(new_spte));
 
 	return old_spte;
 }
@@ -594,7 +585,7 @@ static u64 mmu_spte_clear_track_bits(struct kvm *kvm, u64 *sptep)
 	 * by a refcounted page, the refcount is elevated.
 	 */
 	page = kvm_pfn_to_refcounted_page(pfn);
-	WARN_ON(page && !page_count(page));
+	WARN_ON_ONCE(page && !page_count(page));
 
 	if (is_accessed_spte(old_spte))
 		kvm_set_pfn_accessed(pfn);
@@ -800,16 +791,26 @@ static struct kvm_lpage_info *lpage_info_slot(gfn_t gfn,
 	return &slot->arch.lpage_info[level - 2][idx];
 }
 
+/*
+ * The most significant bit in disallow_lpage tracks whether or not memory
+ * attributes are mixed, i.e. not identical for all gfns at the current level.
+ * The lower order bits are used to refcount other cases where a hugepage is
+ * disallowed, e.g. if KVM has shadow a page table at the gfn.
+ */
+#define KVM_LPAGE_MIXED_FLAG	BIT(31)
+
 static void update_gfn_disallow_lpage_count(const struct kvm_memory_slot *slot,
 					    gfn_t gfn, int count)
 {
 	struct kvm_lpage_info *linfo;
-	int i;
+	int old, i;
 
 	for (i = PG_LEVEL_2M; i <= KVM_MAX_HUGEPAGE_LEVEL; ++i) {
 		linfo = lpage_info_slot(gfn, slot, i);
+
+		old = linfo->disallow_lpage;
 		linfo->disallow_lpage += count;
-		WARN_ON(linfo->disallow_lpage < 0);
+		WARN_ON_ONCE((old ^ linfo->disallow_lpage) & KVM_LPAGE_MIXED_FLAG);
 	}
 }
 
@@ -836,8 +837,7 @@ static void account_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
 
 	/* the non-leaf shadow pages are keeping readonly. */
 	if (sp->role.level > PG_LEVEL_4K)
-		return kvm_slot_page_track_add_page(kvm, slot, gfn,
-						    KVM_PAGE_TRACK_WRITE);
+		return __kvm_write_track_add_gfn(kvm, slot, gfn);
 
 	kvm_mmu_gfn_disallow_lpage(slot, gfn);
 
@@ -883,8 +883,7 @@ static void unaccount_shadowed(struct kvm *kvm, struct kvm_mmu_page *sp)
 	slots = kvm_memslots_for_spte_role(kvm, sp->role);
 	slot = __gfn_to_memslot(slots, gfn);
 	if (sp->role.level > PG_LEVEL_4K)
-		return kvm_slot_page_track_remove_page(kvm, slot, gfn,
-						       KVM_PAGE_TRACK_WRITE);
+		return __kvm_write_track_remove_gfn(kvm, slot, gfn);
 
 	kvm_mmu_gfn_allow_lpage(slot, gfn);
 }
@@ -938,10 +937,8 @@ static int pte_list_add(struct kvm_mmu_memory_cache *cache, u64 *spte,
 	int count = 0;
 
 	if (!rmap_head->val) {
-		rmap_printk("%p %llx 0->1\n", spte, *spte);
 		rmap_head->val = (unsigned long)spte;
 	} else if (!(rmap_head->val & 1)) {
-		rmap_printk("%p %llx 1->many\n", spte, *spte);
 		desc = kvm_mmu_memory_cache_alloc(cache);
 		desc->sptes[0] = (u64 *)rmap_head->val;
 		desc->sptes[1] = spte;
@@ -950,7 +947,6 @@ static int pte_list_add(struct kvm_mmu_memory_cache *cache, u64 *spte,
 		rmap_head->val = (unsigned long)desc | 1;
 		++count;
 	} else {
-		rmap_printk("%p %llx many->many\n", spte, *spte);
 		desc = (struct pte_list_desc *)(rmap_head->val & ~1ul);
 		count = desc->tail_count + desc->spte_count;
 
@@ -970,7 +966,8 @@ static int pte_list_add(struct kvm_mmu_memory_cache *cache, u64 *spte,
 	return count;
 }
 
-static void pte_list_desc_remove_entry(struct kvm_rmap_head *rmap_head,
+static void pte_list_desc_remove_entry(struct kvm *kvm,
+				       struct kvm_rmap_head *rmap_head,
 				       struct pte_list_desc *desc, int i)
 {
 	struct pte_list_desc *head_desc = (struct pte_list_desc *)(rmap_head->val & ~1ul);
@@ -981,7 +978,7 @@ static void pte_list_desc_remove_entry(struct kvm_rmap_head *rmap_head,
 	 * when adding an entry and the previous head is full, and heads are
 	 * removed (this flow) when they become empty.
 	 */
-	BUG_ON(j < 0);
+	KVM_BUG_ON_DATA_CORRUPTION(j < 0, kvm);
 
 	/*
 	 * Replace the to-be-freed SPTE with the last valid entry from the head
@@ -996,7 +993,7 @@ static void pte_list_desc_remove_entry(struct kvm_rmap_head *rmap_head,
 
 	/*
 	 * The head descriptor is empty.  If there are no tail descriptors,
-	 * nullify the rmap head to mark the list as emtpy, else point the rmap
+	 * nullify the rmap head to mark the list as empty, else point the rmap
 	 * head at the next descriptor, i.e. the new head.
 	 */
 	if (!head_desc->more)
@@ -1006,35 +1003,34 @@ static void pte_list_desc_remove_entry(struct kvm_rmap_head *rmap_head,
 	mmu_free_pte_list_desc(head_desc);
 }
 
-static void pte_list_remove(u64 *spte, struct kvm_rmap_head *rmap_head)
+static void pte_list_remove(struct kvm *kvm, u64 *spte,
+			    struct kvm_rmap_head *rmap_head)
 {
 	struct pte_list_desc *desc;
 	int i;
 
-	if (!rmap_head->val) {
-		pr_err("%s: %p 0->BUG\n", __func__, spte);
-		BUG();
-	} else if (!(rmap_head->val & 1)) {
-		rmap_printk("%p 1->0\n", spte);
-		if ((u64 *)rmap_head->val != spte) {
-			pr_err("%s:  %p 1->BUG\n", __func__, spte);
-			BUG();
-		}
+	if (KVM_BUG_ON_DATA_CORRUPTION(!rmap_head->val, kvm))
+		return;
+
+	if (!(rmap_head->val & 1)) {
+		if (KVM_BUG_ON_DATA_CORRUPTION((u64 *)rmap_head->val != spte, kvm))
+			return;
+
 		rmap_head->val = 0;
 	} else {
-		rmap_printk("%p many->many\n", spte);
 		desc = (struct pte_list_desc *)(rmap_head->val & ~1ul);
 		while (desc) {
 			for (i = 0; i < desc->spte_count; ++i) {
 				if (desc->sptes[i] == spte) {
-					pte_list_desc_remove_entry(rmap_head, desc, i);
+					pte_list_desc_remove_entry(kvm, rmap_head,
+								   desc, i);
 					return;
 				}
 			}
 			desc = desc->more;
 		}
-		pr_err("%s: %p many->many\n", __func__, spte);
-		BUG();
+
+		KVM_BUG_ON_DATA_CORRUPTION(true, kvm);
 	}
 }
 
@@ -1042,7 +1038,7 @@ static void kvm_zap_one_rmap_spte(struct kvm *kvm,
 				  struct kvm_rmap_head *rmap_head, u64 *sptep)
 {
 	mmu_spte_clear_track_bits(kvm, sptep);
-	pte_list_remove(sptep, rmap_head);
+	pte_list_remove(kvm, sptep, rmap_head);
 }
 
 /* Return true if at least one SPTE was zapped, false otherwise */
@@ -1117,7 +1113,7 @@ static void rmap_remove(struct kvm *kvm, u64 *spte)
 	slot = __gfn_to_memslot(slots, gfn);
 	rmap_head = gfn_to_rmap(gfn, sp->role.level, slot);
 
-	pte_list_remove(spte, rmap_head);
+	pte_list_remove(kvm, spte, rmap_head);
 }
 
 /*
@@ -1209,7 +1205,7 @@ static void drop_large_spte(struct kvm *kvm, u64 *sptep, bool flush)
 	struct kvm_mmu_page *sp;
 
 	sp = sptep_to_sp(sptep);
-	WARN_ON(sp->role.level == PG_LEVEL_4K);
+	WARN_ON_ONCE(sp->role.level == PG_LEVEL_4K);
 
 	drop_spte(kvm, sptep);
 
@@ -1238,8 +1234,6 @@ static bool spte_write_protect(u64 *sptep, bool pt_protect)
 	    !(pt_protect && is_mmu_writable_spte(spte)))
 		return false;
 
-	rmap_printk("spte %p %llx\n", sptep, *sptep);
-
 	if (pt_protect)
 		spte &= ~shadow_mmu_writable_mask;
 	spte = spte & ~PT_WRITABLE_MASK;
@@ -1264,9 +1258,7 @@ static bool spte_clear_dirty(u64 *sptep)
 {
 	u64 spte = *sptep;
 
-	rmap_printk("spte %p %llx\n", sptep, *sptep);
-
-	MMU_WARN_ON(!spte_ad_enabled(spte));
+	KVM_MMU_WARN_ON(!spte_ad_enabled(spte));
 	spte &= ~shadow_dirty_mask;
 	return mmu_spte_update(sptep, spte);
 }
@@ -1396,7 +1388,7 @@ void kvm_arch_mmu_enable_log_dirty_pt_masked(struct kvm *kvm,
 		gfn_t end = slot->base_gfn + gfn_offset + __fls(mask);
 
 		if (READ_ONCE(eager_page_split))
-			kvm_mmu_try_split_huge_pages(kvm, slot, start, end, PG_LEVEL_4K);
+			kvm_mmu_try_split_huge_pages(kvm, slot, start, end + 1, PG_LEVEL_4K);
 
 		kvm_mmu_slot_gfn_write_protect(kvm, slot, start, PG_LEVEL_2M);
 
@@ -1472,14 +1464,11 @@ static bool kvm_set_pte_rmap(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
 	u64 new_spte;
 	kvm_pfn_t new_pfn;
 
-	WARN_ON(pte_huge(pte));
+	WARN_ON_ONCE(pte_huge(pte));
 	new_pfn = pte_pfn(pte);
 
 restart:
 	for_each_rmap_spte(rmap_head, &iter, sptep) {
-		rmap_printk("spte %p %llx gfn %llx (%d)\n",
-			    sptep, *sptep, gfn, level);
-
 		need_flush = true;
 
 		if (pte_write(pte)) {
@@ -1585,7 +1574,7 @@ static __always_inline bool kvm_handle_gfn_range(struct kvm *kvm,
 	for_each_slot_rmap_range(range->slot, PG_LEVEL_4K, KVM_MAX_HUGEPAGE_LEVEL,
 				 range->start, range->end - 1, &iterator)
 		ret |= handler(kvm, iterator.rmap, range->slot, iterator.gfn,
-			       iterator.level, range->pte);
+			       iterator.level, range->arg.pte);
 
 	return ret;
 }
@@ -1599,6 +1588,10 @@ bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
 
 	if (tdp_mmu_enabled)
 		flush = kvm_tdp_mmu_unmap_gfn_range(kvm, range, flush);
+
+	if (kvm_x86_ops.set_apic_access_page_addr &&
+	    range->slot->id == APIC_ACCESS_PAGE_PRIVATE_MEMSLOT)
+		kvm_make_all_cpus_request(kvm, KVM_REQ_APIC_PAGE_RELOAD);
 
 	return flush;
 }
@@ -1703,21 +1696,19 @@ bool kvm_test_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
 	return young;
 }
 
-#ifdef MMU_DEBUG
-static int is_empty_shadow_page(u64 *spt)
+static void kvm_mmu_check_sptes_at_free(struct kvm_mmu_page *sp)
 {
-	u64 *pos;
-	u64 *end;
+#ifdef CONFIG_KVM_PROVE_MMU
+	int i;
 
-	for (pos = spt, end = pos + SPTE_ENT_PER_PAGE; pos != end; pos++)
-		if (is_shadow_present_pte(*pos)) {
-			printk(KERN_ERR "%s: %p %llx\n", __func__,
-			       pos, *pos);
-			return 0;
-		}
-	return 1;
-}
+	for (i = 0; i < SPTE_ENT_PER_PAGE; i++) {
+		if (KVM_MMU_WARN_ON(is_shadow_present_pte(sp->spt[i])))
+			pr_err_ratelimited("SPTE %llx (@ %p) for gfn %llx shadow-present at free",
+					   sp->spt[i], &sp->spt[i],
+					   kvm_mmu_page_get_gfn(sp, i));
+	}
 #endif
+}
 
 /*
  * This value is the sum of all of the kvm instances's
@@ -1745,7 +1736,8 @@ static void kvm_unaccount_mmu_page(struct kvm *kvm, struct kvm_mmu_page *sp)
 
 static void kvm_mmu_free_shadow_page(struct kvm_mmu_page *sp)
 {
-	MMU_WARN_ON(!is_empty_shadow_page(sp->spt));
+	kvm_mmu_check_sptes_at_free(sp);
+
 	hlist_del(&sp->hash_link);
 	list_del(&sp->link);
 	free_page((unsigned long)sp->spt);
@@ -1768,16 +1760,16 @@ static void mmu_page_add_parent_pte(struct kvm_mmu_memory_cache *cache,
 	pte_list_add(cache, parent_pte, &sp->parent_ptes);
 }
 
-static void mmu_page_remove_parent_pte(struct kvm_mmu_page *sp,
+static void mmu_page_remove_parent_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 				       u64 *parent_pte)
 {
-	pte_list_remove(parent_pte, &sp->parent_ptes);
+	pte_list_remove(kvm, parent_pte, &sp->parent_ptes);
 }
 
-static void drop_parent_pte(struct kvm_mmu_page *sp,
+static void drop_parent_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 			    u64 *parent_pte)
 {
-	mmu_page_remove_parent_pte(sp, parent_pte);
+	mmu_page_remove_parent_pte(kvm, sp, parent_pte);
 	mmu_spte_clear_no_track(parent_pte);
 }
 
@@ -1833,7 +1825,7 @@ static int mmu_pages_add(struct kvm_mmu_pages *pvec, struct kvm_mmu_page *sp,
 static inline void clear_unsync_child_bit(struct kvm_mmu_page *sp, int idx)
 {
 	--sp->unsync_children;
-	WARN_ON((int)sp->unsync_children < 0);
+	WARN_ON_ONCE((int)sp->unsync_children < 0);
 	__clear_bit(idx, sp->unsync_child_bitmap);
 }
 
@@ -1891,7 +1883,7 @@ static int mmu_unsync_walk(struct kvm_mmu_page *sp,
 
 static void kvm_unlink_unsync_page(struct kvm *kvm, struct kvm_mmu_page *sp)
 {
-	WARN_ON(!sp->unsync);
+	WARN_ON_ONCE(!sp->unsync);
 	trace_kvm_mmu_sync_page(sp);
 	sp->unsync = 0;
 	--kvm->stat.mmu_unsync;
@@ -2066,11 +2058,11 @@ static int mmu_pages_first(struct kvm_mmu_pages *pvec,
 	if (pvec->nr == 0)
 		return 0;
 
-	WARN_ON(pvec->page[0].idx != INVALID_INDEX);
+	WARN_ON_ONCE(pvec->page[0].idx != INVALID_INDEX);
 
 	sp = pvec->page[0].sp;
 	level = sp->role.level;
-	WARN_ON(level == PG_LEVEL_4K);
+	WARN_ON_ONCE(level == PG_LEVEL_4K);
 
 	parents->parent[level-2] = sp;
 
@@ -2092,7 +2084,7 @@ static void mmu_pages_clear_parents(struct mmu_page_path *parents)
 		if (!sp)
 			return;
 
-		WARN_ON(idx == INVALID_INDEX);
+		WARN_ON_ONCE(idx == INVALID_INDEX);
 		clear_unsync_child_bit(sp, idx);
 		level++;
 	} while (!sp->unsync_children);
@@ -2213,7 +2205,7 @@ static struct kvm_mmu_page *kvm_mmu_find_shadow_page(struct kvm *kvm,
 			if (ret < 0)
 				break;
 
-			WARN_ON(!list_empty(&invalid_list));
+			WARN_ON_ONCE(!list_empty(&invalid_list));
 			if (ret > 0)
 				kvm_flush_remote_tlbs(kvm);
 		}
@@ -2492,7 +2484,7 @@ static void validate_direct_spte(struct kvm_vcpu *vcpu, u64 *sptep,
 		if (child->role.access == direct_access)
 			return;
 
-		drop_parent_pte(child, sptep);
+		drop_parent_pte(vcpu->kvm, child, sptep);
 		kvm_flush_remote_tlbs_sptep(vcpu->kvm, sptep);
 	}
 }
@@ -2510,7 +2502,7 @@ static int mmu_page_zap_pte(struct kvm *kvm, struct kvm_mmu_page *sp,
 			drop_spte(kvm, spte);
 		} else {
 			child = spte_to_child_sp(pte);
-			drop_parent_pte(child, spte);
+			drop_parent_pte(kvm, child, spte);
 
 			/*
 			 * Recursively zap nested TDP SPs, parentless SPs are
@@ -2541,13 +2533,13 @@ static int kvm_mmu_page_unlink_children(struct kvm *kvm,
 	return zapped;
 }
 
-static void kvm_mmu_unlink_parents(struct kvm_mmu_page *sp)
+static void kvm_mmu_unlink_parents(struct kvm *kvm, struct kvm_mmu_page *sp)
 {
 	u64 *sptep;
 	struct rmap_iterator iter;
 
 	while ((sptep = rmap_get_first(&sp->parent_ptes, &iter)))
-		drop_parent_pte(sp, sptep);
+		drop_parent_pte(kvm, sp, sptep);
 }
 
 static int mmu_zap_unsync_children(struct kvm *kvm,
@@ -2586,7 +2578,7 @@ static bool __kvm_mmu_prepare_zap_page(struct kvm *kvm,
 	++kvm->stat.mmu_shadow_zapped;
 	*nr_zapped = mmu_zap_unsync_children(kvm, sp, invalid_list);
 	*nr_zapped += kvm_mmu_page_unlink_children(kvm, sp, invalid_list);
-	kvm_mmu_unlink_parents(sp);
+	kvm_mmu_unlink_parents(kvm, sp);
 
 	/* Zapping children means active_mmu_pages has become unstable. */
 	list_unstable = *nr_zapped;
@@ -2668,7 +2660,7 @@ static void kvm_mmu_commit_zap_page(struct kvm *kvm,
 	kvm_flush_remote_tlbs(kvm);
 
 	list_for_each_entry_safe(sp, nsp, invalid_list, link) {
-		WARN_ON(!sp->role.invalid || sp->root_count);
+		WARN_ON_ONCE(!sp->role.invalid || sp->root_count);
 		kvm_mmu_free_shadow_page(sp);
 	}
 }
@@ -2768,12 +2760,9 @@ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn)
 	LIST_HEAD(invalid_list);
 	int r;
 
-	pgprintk("%s: looking for gfn %llx\n", __func__, gfn);
 	r = 0;
 	write_lock(&kvm->mmu_lock);
 	for_each_gfn_valid_sp_with_gptes(kvm, sp, gfn) {
-		pgprintk("%s: gfn %llx role %x\n", __func__, gfn,
-			 sp->role.word);
 		r = 1;
 		kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list);
 	}
@@ -2824,7 +2813,7 @@ int mmu_try_to_unsync_pages(struct kvm *kvm, const struct kvm_memory_slot *slot,
 	 * track machinery is used to write-protect upper-level shadow pages,
 	 * i.e. this guards the role.level == 4K assertion below!
 	 */
-	if (kvm_slot_page_track_is_active(kvm, slot, gfn, KVM_PAGE_TRACK_WRITE))
+	if (kvm_gfn_is_write_tracked(kvm, slot, gfn))
 		return -EPERM;
 
 	/*
@@ -2857,16 +2846,16 @@ int mmu_try_to_unsync_pages(struct kvm *kvm, const struct kvm_memory_slot *slot,
 			/*
 			 * Recheck after taking the spinlock, a different vCPU
 			 * may have since marked the page unsync.  A false
-			 * positive on the unprotected check above is not
+			 * negative on the unprotected check above is not
 			 * possible as clearing sp->unsync _must_ hold mmu_lock
-			 * for write, i.e. unsync cannot transition from 0->1
+			 * for write, i.e. unsync cannot transition from 1->0
 			 * while this CPU holds mmu_lock for read (or write).
 			 */
 			if (READ_ONCE(sp->unsync))
 				continue;
 		}
 
-		WARN_ON(sp->role.level != PG_LEVEL_4K);
+		WARN_ON_ONCE(sp->role.level != PG_LEVEL_4K);
 		kvm_unsync_page(kvm, sp);
 	}
 	if (locked)
@@ -2931,9 +2920,6 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 	bool prefetch = !fault || fault->prefetch;
 	bool write_fault = fault && fault->write;
 
-	pgprintk("%s: spte %llx write_fault %d gfn %llx\n", __func__,
-		 *sptep, write_fault, gfn);
-
 	if (unlikely(is_noslot_pfn(pfn))) {
 		vcpu->stat.pf_mmio_spte_created++;
 		mark_mmio_spte(vcpu, sptep, gfn, pte_access);
@@ -2950,11 +2936,9 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 			u64 pte = *sptep;
 
 			child = spte_to_child_sp(pte);
-			drop_parent_pte(child, sptep);
+			drop_parent_pte(vcpu->kvm, child, sptep);
 			flush = true;
 		} else if (pfn != spte_to_pfn(*sptep)) {
-			pgprintk("hfn old %llx new %llx\n",
-				 spte_to_pfn(*sptep), pfn);
 			drop_spte(vcpu->kvm, sptep);
 			flush = true;
 		} else
@@ -2978,8 +2962,6 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 
 	if (flush)
 		kvm_flush_remote_tlbs_gfn(vcpu->kvm, gfn, level);
-
-	pgprintk("%s: setting spte %llx\n", __func__, *sptep);
 
 	if (!was_rmapped) {
 		WARN_ON_ONCE(ret == RET_PF_SPURIOUS);
@@ -3026,7 +3008,7 @@ static void __direct_pte_prefetch(struct kvm_vcpu *vcpu,
 	u64 *spte, *start = NULL;
 	int i;
 
-	WARN_ON(!sp->role.direct);
+	WARN_ON_ONCE(!sp->role.direct);
 
 	i = spte_index(sptep) & ~(PTE_PREFETCH_NUM - 1);
 	spte = sp->spt + i;
@@ -3080,7 +3062,7 @@ static void direct_pte_prefetch(struct kvm_vcpu *vcpu, u64 *sptep)
  *
  * There are several ways to safely use this helper:
  *
- * - Check mmu_invalidate_retry_hva() after grabbing the mapping level, before
+ * - Check mmu_invalidate_retry_gfn() after grabbing the mapping level, before
  *   consuming it.  In this case, mmu_lock doesn't need to be held during the
  *   lookup, but it does need to be held while checking the MMU notifier.
  *
@@ -3161,9 +3143,8 @@ out:
 	return level;
 }
 
-int kvm_mmu_max_mapping_level(struct kvm *kvm,
-			      const struct kvm_memory_slot *slot, gfn_t gfn,
-			      int max_level)
+static int __                          struct kvm *kvm,
+			                                                       gfn_t gfn, int max_level, bool is_private)
 {
 	struct kvm_lpage_info *linfo;
 	int host_level;
@@ -3175,11 +3156,24 @@ int kvm_mmu_max_mapping_level(struct kvm *kvm,
 			break;
 	}
 
+	if (is_private)
+		return max_level;
+
 	if (max_level == PG_LEVEL_4K)
 		return PG_LEVEL_4K;
 
 	host_level = host_pfn_mapping_level(kvm, gfn, slot);
 	return min(host_level, max_level);
+}
+
+int kvm_mmu_max_mapping_level(struct kvm *kvm,
+			      const struct kvm_memory_slot *slot, gfn_t gfn,
+			      int max_level)
+{
+	bool is_private = kvm_slot_can_be_private(slot) &&
+			  kvm_mem_is_private(kvm, gfn);
+
+	return __                                     gfn, max_level, is_private);
 }
 
 void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
@@ -3202,8 +3196,9 @@ void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	 * Enforce the iTLB multihit workaround after capturing the requested
 	 * level, which will be used to do precise, accurate accounting.
 	 */
-	fault->req_level = kvm_mmu_max_mapping_level(vcpu->kvm, slot,
-						     fault->gfn, fault->max_level);
+	fault->req_level = __                          vcpu->kvm, slot,
+						       fault->gfn, fault->max_level,
+						       fault->is_private);
 	if (fault->req_level == PG_LEVEL_4K || fault->huge_page_disallowed)
 		return;
 
@@ -3336,3845 +3331,219 @@ static int kvm_handle_noslot_fault(struct kvm_vcpu *vcpu,
 	 * only if L1's MAXPHYADDR is inaccurate with respect to the
 	 * hardware's).
 	 */
-	if (unlikely(fault->gfn > kvm_mmu_max_gfn()))
-		return RET_PF_EMULATE;
+	if (unlikely(fault->gfn > kvm_mmu_max_gfn()p, spte_index(start));
+	slo                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              ;
+	u64 *sptep                                                                                                                                                                                                                                                                                                                     /*
+		 * It's entirely possible for the mapping to have been zapped
+		 * by a different task, but the root page should always be
+		 * available as the vCPU holds a reference to its root(s).
+		                       !sptep))
+			spte = REMOVED_SPTE;
 
-	return RET_PF_CONTINUE;
+		if (!is_shadow_present_pte(                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   kvm_arch_nr_memslot_as_ids(kvm)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     (root_pgd & __PT_BASE_ADDR_MASK)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       u8 kvm_max_level_for_order(int order)
+{
+	BUILD_BUG_ON(KVM_MAX_HUGEPAGE_LEVEL > PG_LEVEL_1G);
+
+	KVM_MMU_WARN_ON(order != KVM_HPAGE_GFN_SHIFT(PG_LEVEL_1G) &&
+			order != KVM_HPAGE_GFN_SHIFT(PG_LEVEL_2M) &&
+			order != KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K));
+
+	if (order >= KVM_HPAGE_GFN_SHIFT(PG_LEVEL_1G))
+		return PG_LEVEL_1G;
+
+	if (order >= KVM_HPAGE_GFN_SHIFT(PG_LEVEL_2M))
+		return PG_LEVEL_2M;
+
+	return PG_LEVEL_4K;
 }
 
-static bool page_fault_can_be_fast(struct kvm_page_fault *fault)
+static void kvm_mmu_prepare_memory_fault_exi                           			      struct kvm_page_fault *fault)
 {
-	/*
-	 * Page faults with reserved bits set, i.e. faults on MMIO SPTEs, only
-	 * reach the common page fault handler if the SPTE has an invalid MMIO
-	 * generation number.  Refreshing the MMIO generation needs to go down
-	 * the slow path.  Note, EPT Misconfigs do NOT set the PRESENT flag!
-	 */
-	if (fault->rsvd)
-		return false;
-
-	/*
-	 * #PF can be fast if:
-	 *
-	 * 1. The shadow page table entry is not present and A/D bits are
-	 *    disabled _by KVM_, which could mean that the fault is potentially
-	 *    caused by access tracking (if enabled).  If A/D bits are enabled
-	 *    by KVM, but disabled by L1 for L2, KVM is forced to disable A/D
-	 *    bits for L2 and employ access tracking, but the fast page fault
-	 *    mechanism only supports direct MMUs.
-	 * 2. The shadow page table entry is present, the access is a write,
-	 *    and no reserved bits are set (MMIO SPTEs cannot be "fixed"), i.e.
-	 *    the fault was caused by a write-protection violation.  If the
-	 *    SPTE is MMU-writable (determined later), the fault can be fixed
-	 *    by setting the Writable bit, which can be done out of mmu_lock.
-	 */
-	if (!fault->present)
-		return !kvm_ad_enabled();
-
-	/*
-	 * Note, instruction fetches and writes are mutually exclusive, ignore
-	 * the "exec" flag.
-	 */
-	return fault->write;
+	kvm_prepare_memory_fault_exit(vcpu, fault->gfn << PAGE_SHIFT,
+				      PAGE_SIZE, fault->write, fault->exec,
+				      fault->is_private);
 }
 
-/*
- * Returns true if the SPTE was fixed successfully. Otherwise,
- * someone else modified the SPTE from its original value.
- */
-static bool fast_pf_fix_direct_spte(struct kvm_vcpu *vcpu,
-				    struct kvm_page_fault *fault,
-				    u64 *sptep, u64 old_spte, u64 new_spte)
-{
-	/*
-	 * Theoretically we could also set dirty bit (and flush TLB) here in
-	 * order to eliminate unnecessary PML logging. See comments in
-	 * set_spte. But fast_page_fault is very unlikely to happen with PML
-	 * enabled, so we do not do this. This might result in the same GPA
-	 * to be logged in PML buffer again when the write really happens, and
-	 * eventually to be called by mark_page_dirty twice. But it's also no
-	 * harm. This also avoids the TLB flush needed after setting dirty bit
-	 * so non-PML cases won't be impacted.
-	 *
-	 * Compare with set_spte where instead shadow_dirty_mask is set.
-	 */
-	if (!try_cmpxchg64(sptep, &old_spte, new_spte))
-		return false;
+static int kvm_faultin_pfn_priv                                  struct kvm_page_fault *fault     int max_order, r;
 
-	if (is_writable_pte(new_spte) && !is_writable_pte(old_spte))
-		mark_page_dirty_in_slot(vcpu->kvm, fault->slot, fault->gfn);
-
-	return true;
-}
-
-static bool is_access_allowed(struct kvm_page_fault *fault, u64 spte)
-{
-	if (fault->exec)
-		return is_executable_pte(spte);
-
-	if (fault->write)
-		return is_writable_pte(spte);
-
-	/* Fault was on Read access */
-	return spte & PT_PRESENT_MASK;
-}
-
-/*
- * Returns the last level spte pointer of the shadow page walk for the given
- * gpa, and sets *spte to the spte value. This spte may be non-preset. If no
- * walk could be performed, returns NULL and *spte does not contain valid data.
- *
- * Contract:
- *  - Must be called between walk_shadow_page_lockless_{begin,end}.
- *  - The returned sptep must not be used after walk_shadow_page_lockless_end.
- */
-static u64 *fast_pf_get_last_sptep(struct kvm_vcpu *vcpu, gpa_t gpa, u64 *spte)
-{
-	struct kvm_shadow_walk_iterator iterator;
-	u64 old_spte;
-	u64 *sptep = NULL;
-
-	for_each_shadow_entry_lockless(vcpu, gpa, iterator, old_spte) {
-		sptep = iterator.sptep;
-		*spte = old_spte;
-	}
-
-	return sptep;
-}
-
-/*
- * Returns one of RET_PF_INVALID, RET_PF_FIXED or RET_PF_SPURIOUS.
- */
-static int fast_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
-{
-	struct kvm_mmu_page *sp;
-	int ret = RET_PF_INVALID;
-	u64 spte = 0ull;
-	u64 *sptep = NULL;
-	uint retry_count = 0;
-
-	if (!page_fault_can_be_fast(fault))
-		return ret;
-
-	walk_shadow_page_lockless_begin(vcpu);
-
-	do {
-		u64 new_spte;
-
-		if (tdp_mmu_enabled)
-			sptep = kvm_tdp_mmu_fast_pf_get_last_sptep(vcpu, fault->addr, &spte);
-		else
-			sptep = fast_pf_get_last_sptep(vcpu, fault->addr, &spte);
-
-		if (!is_shadow_present_pte(spte))
-			break;
-
-		sp = sptep_to_sp(sptep);
-		if (!is_last_spte(spte, sp->role.level))
-			break;
-
-		/*
-		 * Check whether the memory access that caused the fault would
-		 * still cause it if it were to be performed right now. If not,
-		 * then this is a spurious fault caused by TLB lazily flushed,
-		 * or some other CPU has already fixed the PTE after the
-		 * current CPU took the fault.
-		 *
-		 * Need not check the access of upper level table entries since
-		 * they are always ACC_ALL.
-		 */
-		if (is_access_allowed(fault, spte)) {
-			ret = RET_PF_SPURIOUS;
-			break;
-		}
-
-		new_spte = spte;
-
-		/*
-		 * KVM only supports fixing page faults outside of MMU lock for
-		 * direct MMUs, nested MMUs are always indirect, and KVM always
-		 * uses A/D bits for non-nested MMUs.  Thus, if A/D bits are
-		 * enabled, the SPTE can't be an access-tracked SPTE.
-		 */
-		if (unlikely(!kvm_ad_enabled()) && is_access_track_spte(spte))
-			new_spte = restore_acc_track_spte(new_spte);
-
-		/*
-		 * To keep things simple, only SPTEs that are MMU-writable can
-		 * be made fully writable outside of mmu_lock, e.g. only SPTEs
-		 * that were write-protected for dirty-logging or access
-		 * tracking are handled here.  Don't bother checking if the
-		 * SPTE is writable to prioritize running with A/D bits enabled.
-		 * The is_access_allowed() check above handles the common case
-		 * of the fault being spurious, and the SPTE is known to be
-		 * shadow-present, i.e. except for access tracking restoration
-		 * making the new SPTE writable, the check is wasteful.
-		 */
-		if (fault->write && is_mmu_writable_spte(spte)) {
-			new_spte |= PT_WRITABLE_MASK;
-
-			/*
-			 * Do not fix write-permission on the large spte when
-			 * dirty logging is enabled. Since we only dirty the
-			 * first page into the dirty-bitmap in
-			 * fast_pf_fix_direct_spte(), other pages are missed
-			 * if its slot has dirty logging enabled.
-			 *
-			 * Instead, we let the slow page fault path create a
-			 * normal spte to fix the access.
-			 */
-			if (sp->role.level > PG_LEVEL_4K &&
-			    kvm_slot_dirty_track_enabled(fault->slot))
-				break;
-		}
-
-		/* Verify that the fault can be handled in the fast path */
-		if (new_spte == spte ||
-		    !is_access_allowed(fault, new_spte))
-			break;
-
-		/*
-		 * Currently, fast page fault only works for direct mapping
-		 * since the gfn is not stable for indirect shadow page. See
-		 * Documentation/virt/kvm/locking.rst to get more detail.
-		 */
-		if (fast_pf_fix_direct_spte(vcpu, fault, sptep, spte, new_spte)) {
-			ret = RET_PF_FIXED;
-			break;
-		}
-
-		if (++retry_count > 4) {
-			pr_warn_once("Fast #PF retrying more than 4 times.\n");
-			break;
-		}
-
-	} while (true);
-
-	trace_fast_page_fault(vcpu, fault, sptep, spte, ret);
-	walk_shadow_page_lockless_end(vcpu);
-
-	if (ret != RET_PF_INVALID)
-		vcpu->stat.pf_fast++;
-
-	return ret;
-}
-
-static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
-			       struct list_head *invalid_list)
-{
-	struct kvm_mmu_page *sp;
-
-	if (!VALID_PAGE(*root_hpa))
-		return;
-
-	/*
-	 * The "root" may be a special root, e.g. a PAE entry, treat it as a
-	 * SPTE to ensure any non-PA bits are dropped.
-	 */
-	sp = spte_to_child_sp(*root_hpa);
-	if (WARN_ON(!sp))
-		return;
-
-	if (is_tdp_mmu_page(sp))
-		kvm_tdp_mmu_put_root(kvm, sp, false);
-	else if (!--sp->root_count && sp->role.invalid)
-		kvm_mmu_prepare_zap_page(kvm, sp, invalid_list);
-
-	*root_hpa = INVALID_PAGE;
-}
-
-/* roots_to_free must be some combination of the KVM_MMU_ROOT_* flags */
-void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
-			ulong roots_to_free)
-{
-	int i;
-	LIST_HEAD(invalid_list);
-	bool free_active_root;
-
-	WARN_ON_ONCE(roots_to_free & ~KVM_MMU_ROOTS_ALL);
-
-	BUILD_BUG_ON(KVM_MMU_NUM_PREV_ROOTS >= BITS_PER_LONG);
-
-	/* Before acquiring the MMU lock, see if we need to do any real work. */
-	free_active_root = (roots_to_free & KVM_MMU_ROOT_CURRENT)
-		&& VALID_PAGE(mmu->root.hpa);
-
-	if (!free_active_root) {
-		for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
-			if ((roots_to_free & KVM_MMU_ROOT_PREVIOUS(i)) &&
-			    VALID_PAGE(mmu->prev_roots[i].hpa))
-				break;
-
-		if (i == KVM_MMU_NUM_PREV_ROOTS)
-			return;
-	}
-
-	write_lock(&kvm->mmu_lock);
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
-		if (roots_to_free & KVM_MMU_ROOT_PREVIOUS(i))
-			mmu_free_root_page(kvm, &mmu->prev_roots[i].hpa,
-					   &invalid_list);
-
-	if (free_active_root) {
-		if (to_shadow_page(mmu->root.hpa)) {
-			mmu_free_root_page(kvm, &mmu->root.hpa, &invalid_list);
-		} else if (mmu->pae_root) {
-			for (i = 0; i < 4; ++i) {
-				if (!IS_VALID_PAE_ROOT(mmu->pae_root[i]))
-					continue;
-
-				mmu_free_root_page(kvm, &mmu->pae_root[i],
-						   &invalid_list);
-				mmu->pae_root[i] = INVALID_PAE_ROOT;
-			}
-		}
-		mmu->root.hpa = INVALID_PAGE;
-		mmu->root.pgd = 0;
-	}
-
-	kvm_mmu_commit_zap_page(kvm, &invalid_list);
-	write_unlock(&kvm->mmu_lock);
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_free_roots);
-
-void kvm_mmu_free_guest_mode_roots(struct kvm *kvm, struct kvm_mmu *mmu)
-{
-	unsigned long roots_to_free = 0;
-	hpa_t root_hpa;
-	int i;
-
-	/*
-	 * This should not be called while L2 is active, L2 can't invalidate
-	 * _only_ its own roots, e.g. INVVPID unconditionally exits.
-	 */
-	WARN_ON_ONCE(mmu->root_role.guest_mode);
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
-		root_hpa = mmu->prev_roots[i].hpa;
-		if (!VALID_PAGE(root_hpa))
-			continue;
-
-		if (!to_shadow_page(root_hpa) ||
-			to_shadow_page(root_hpa)->role.guest_mode)
-			roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
-	}
-
-	kvm_mmu_free_roots(kvm, mmu, roots_to_free);
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_free_guest_mode_roots);
-
-
-static int mmu_check_root(struct kvm_vcpu *vcpu, gfn_t root_gfn)
-{
-	int ret = 0;
-
-	if (!kvm_vcpu_is_visible_gfn(vcpu, root_gfn)) {
-		kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
-		ret = 1;
-	}
-
-	return ret;
-}
-
-static hpa_t mmu_alloc_root(struct kvm_vcpu *vcpu, gfn_t gfn, int quadrant,
-			    u8 level)
-{
-	union kvm_mmu_page_role role = vcpu->arch.mmu->root_role;
-	struct kvm_mmu_page *sp;
-
-	role.level = level;
-	role.quadrant = quadrant;
-
-	WARN_ON_ONCE(quadrant && !role.has_4_byte_gpte);
-	WARN_ON_ONCE(role.direct && role.has_4_byte_gpte);
-
-	sp = kvm_mmu_get_shadow_page(vcpu, gfn, role);
-	++sp->root_count;
-
-	return __pa(sp->spt);
-}
-
-static int mmu_alloc_direct_roots(struct kvm_vcpu *vcpu)
-{
-	struct kvm_mmu *mmu = vcpu->arch.mmu;
-	u8 shadow_root_level = mmu->root_role.level;
-	hpa_t root;
-	unsigned i;
-	int r;
-
-	write_lock(&vcpu->kvm->mmu_lock);
-	r = make_mmu_pages_available(vcpu);
-	if (r < 0)
-		goto out_unlock;
-
-	if (tdp_mmu_enabled) {
-		root = kvm_tdp_mmu_get_vcpu_root_hpa(vcpu);
-		mmu->root.hpa = root;
-	} else if (shadow_root_level >= PT64_ROOT_4LEVEL) {
-		root = mmu_alloc_root(vcpu, 0, 0, shadow_root_level);
-		mmu->root.hpa = root;
-	} else if (shadow_root_level == PT32E_ROOT_LEVEL) {
-		if (WARN_ON_ONCE(!mmu->pae_root)) {
-			r = -EIO;
-			goto out_unlock;
-		}
-
-		for (i = 0; i < 4; ++i) {
-			WARN_ON_ONCE(IS_VALID_PAE_ROOT(mmu->pae_root[i]));
-
-			root = mmu_alloc_root(vcpu, i << (30 - PAGE_SHIFT), 0,
-					      PT32_ROOT_LEVEL);
-			mmu->pae_root[i] = root | PT_PRESENT_MASK |
-					   shadow_me_value;
-		}
-		mmu->root.hpa = __pa(mmu->pae_root);
-	} else {
-		WARN_ONCE(1, "Bad TDP root level = %d\n", shadow_root_level);
-		r = -EIO;
-		goto out_unlock;
-	}
-
-	/* root.pgd is ignored for direct MMUs. */
-	mmu->root.pgd = 0;
-out_unlock:
-	write_unlock(&vcpu->kvm->mmu_lock);
-	return r;
-}
-
-static int mmu_first_shadow_root_alloc(struct kvm *kvm)
-{
-	struct kvm_memslots *slots;
-	struct kvm_memory_slot *slot;
-	int r = 0, i, bkt;
-
-	/*
-	 * Check if this is the first shadow root being allocated before
-	 * taking the lock.
-	 */
-	if (kvm_shadow_root_allocated(kvm))
-		return 0;
-
-	mutex_lock(&kvm->slots_arch_lock);
-
-	/* Recheck, under the lock, whether this is the first shadow root. */
-	if (kvm_shadow_root_allocated(kvm))
-		goto out_unlock;
-
-	/*
-	 * Check if anything actually needs to be allocated, e.g. all metadata
-	 * will be allocated upfront if TDP is disabled.
-	 */
-	if (kvm_memslots_have_rmaps(kvm) &&
-	    kvm_page_track_write_tracking_enabled(kvm))
-		goto out_success;
-
-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
-		slots = __kvm_memslots(kvm, i);
-		kvm_for_each_memslot(slot, bkt, slots) {
-			/*
-			 * Both of these functions are no-ops if the target is
-			 * already allocated, so unconditionally calling both
-			 * is safe.  Intentionally do NOT free allocations on
-			 * failure to avoid having to track which allocations
-			 * were made now versus when the memslot was created.
-			 * The metadata is guaranteed to be freed when the slot
-			 * is freed, and will be kept/used if userspace retries
-			 * KVM_RUN instead of killing the VM.
-			 */
-			r = memslot_rmap_alloc(slot, slot->npages);
-			if (r)
-				goto out_unlock;
-			r = kvm_page_track_write_tracking_alloc(slot);
-			if (r)
-				goto out_unlock;
-		}
-	}
-
-	/*
-	 * Ensure that shadow_root_allocated becomes true strictly after
-	 * all the related pointers are set.
-	 */
-out_success:
-	smp_store_release(&kvm->arch.shadow_root_allocated, true);
-
-out_unlock:
-	mutex_unlock(&kvm->slots_arch_lock);
-	return r;
-}
-
-static int mmu_alloc_shadow_roots(struct kvm_vcpu *vcpu)
-{
-	struct kvm_mmu *mmu = vcpu->arch.mmu;
-	u64 pdptrs[4], pm_mask;
-	gfn_t root_gfn, root_pgd;
-	int quadrant, i, r;
-	hpa_t root;
-
-	root_pgd = kvm_mmu_get_guest_pgd(vcpu, mmu);
-	root_gfn = root_pgd >> PAGE_SHIFT;
-
-	if (mmu_check_root(vcpu, root_gfn))
-		return 1;
-
-	/*
-	 * On SVM, reading PDPTRs might access guest memory, which might fault
-	 * and thus might sleep.  Grab the PDPTRs before acquiring mmu_lock.
-	 */
-	if (mmu->cpu_role.base.level == PT32E_ROOT_LEVEL) {
-		for (i = 0; i < 4; ++i) {
-			pdptrs[i] = mmu->get_pdptr(vcpu, i);
-			if (!(pdptrs[i] & PT_PRESENT_MASK))
-				continue;
-
-			if (mmu_check_root(vcpu, pdptrs[i] >> PAGE_SHIFT))
-				return 1;
-		}
-	}
-
-	r = mmu_first_shadow_root_alloc(vcpu->kvm);
-	if (r)
-		return r;
-
-	write_lock(&vcpu->kvm->mmu_lock);
-	r = make_mmu_pages_available(vcpu);
-	if (r < 0)
-		goto out_unlock;
-
-	/*
-	 * Do we shadow a long mode page table? If so we need to
-	 * write-protect the guests page table root.
-	 */
-	if (mmu->cpu_role.base.level >= PT64_ROOT_4LEVEL) {
-		root = mmu_alloc_root(vcpu, root_gfn, 0,
-				      mmu->root_role.level);
-		mmu->root.hpa = root;
-		goto set_root_pgd;
-	}
-
-	if (WARN_ON_ONCE(!mmu->pae_root)) {
-		r = -EIO;
-		goto out_unlock;
-	}
-
-	/*
-	 * We shadow a 32 bit page table. This may be a legacy 2-level
-	 * or a PAE 3-level page table. In either case we need to be aware that
-	 * the shadow page table may be a PAE or a long mode page table.
-	 */
-	pm_mask = PT_PRESENT_MASK | shadow_me_value;
-	if (mmu->root_role.level >= PT64_ROOT_4LEVEL) {
-		pm_mask |= PT_ACCESSED_MASK | PT_WRITABLE_MASK | PT_USER_MASK;
-
-		if (WARN_ON_ONCE(!mmu->pml4_root)) {
-			r = -EIO;
-			goto out_unlock;
-		}
-		mmu->pml4_root[0] = __pa(mmu->pae_root) | pm_mask;
-
-		if (mmu->root_role.level == PT64_ROOT_5LEVEL) {
-			if (WARN_ON_ONCE(!mmu->pml5_root)) {
-				r = -EIO;
-				goto out_unlock;
-			}
-			mmu->pml5_root[0] = __pa(mmu->pml4_root) | pm_mask;
-		}
-	}
-
-	for (i = 0; i < 4; ++i) {
-		WARN_ON_ONCE(IS_VALID_PAE_ROOT(mmu->pae_root[i]));
-
-		if (mmu->cpu_role.base.level == PT32E_ROOT_LEVEL) {
-			if (!(pdptrs[i] & PT_PRESENT_MASK)) {
-				mmu->pae_root[i] = INVALID_PAE_ROOT;
-				continue;
-			}
-			root_gfn = pdptrs[i] >> PAGE_SHIFT;
-		}
-
-		/*
-		 * If shadowing 32-bit non-PAE page tables, each PAE page
-		 * directory maps one quarter of the guest's non-PAE page
-		 * directory. Othwerise each PAE page direct shadows one guest
-		 * PAE page directory so that quadrant should be 0.
-		 */
-		quadrant = (mmu->cpu_role.base.level == PT32_ROOT_LEVEL) ? i : 0;
-
-		root = mmu_alloc_root(vcpu, root_gfn, quadrant, PT32_ROOT_LEVEL);
-		mmu->pae_root[i] = root | pm_mask;
-	}
-
-	if (mmu->root_role.level == PT64_ROOT_5LEVEL)
-		mmu->root.hpa = __pa(mmu->pml5_root);
-	else if (mmu->root_role.level == PT64_ROOT_4LEVEL)
-		mmu->root.hpa = __pa(mmu->pml4_root);
-	else
-		mmu->root.hpa = __pa(mmu->pae_root);
-
-set_root_pgd:
-	mmu->root.pgd = root_pgd;
-out_unlock:
-	write_unlock(&vcpu->kvm->mmu_lock);
-
-	return r;
-}
-
-static int mmu_alloc_special_roots(struct kvm_vcpu *vcpu)
-{
-	struct kvm_mmu *mmu = vcpu->arch.mmu;
-	bool need_pml5 = mmu->root_role.level > PT64_ROOT_4LEVEL;
-	u64 *pml5_root = NULL;
-	u64 *pml4_root = NULL;
-	u64 *pae_root;
-
-	/*
-	 * When shadowing 32-bit or PAE NPT with 64-bit NPT, the PML4 and PDP
-	 * tables are allocated and initialized at root creation as there is no
-	 * equivalent level in the guest's NPT to shadow.  Allocate the tables
-	 * on demand, as running a 32-bit L1 VMM on 64-bit KVM is very rare.
-	 */
-	if (mmu->root_role.direct ||
-	    mmu->cpu_role.base.level >= PT64_ROOT_4LEVEL ||
-	    mmu->root_role.level < PT64_ROOT_4LEVEL)
-		return 0;
-
-	/*
-	 * NPT, the only paging mode that uses this horror, uses a fixed number
-	 * of levels for the shadow page tables, e.g. all MMUs are 4-level or
-	 * all MMus are 5-level.  Thus, this can safely require that pml5_root
-	 * is allocated if the other roots are valid and pml5 is needed, as any
-	 * prior MMU would also have required pml5.
-	 */
-	if (mmu->pae_root && mmu->pml4_root && (!need_pml5 || mmu->pml5_root))
-		return 0;
-
-	/*
-	 * The special roots should always be allocated in concert.  Yell and
-	 * bail if KVM ends up in a state where only one of the roots is valid.
-	 */
-	if (WARN_ON_ONCE(!tdp_enabled || mmu->pae_root || mmu->pml4_root ||
-			 (need_pml5 && mmu->pml5_root)))
-		return -EIO;
-
-	/*
-	 * Unlike 32-bit NPT, the PDP table doesn't need to be in low mem, and
-	 * doesn't need to be decrypted.
-	 */
-	pae_root = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
-	if (!pae_root)
-		return -ENOMEM;
-
-#ifdef CONFIG_X86_64
-	pml4_root = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
-	if (!pml4_root)
-		goto err_pml4;
-
-	if (need_pml5) {
-		pml5_root = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
-		if (!pml5_root)
-			goto err_pml5;
-	}
-#endif
-
-	mmu->pae_root = pae_root;
-	mmu->pml4_root = pml4_root;
-	mmu->pml5_root = pml5_root;
-
-	return 0;
-
-#ifdef CONFIG_X86_64
-err_pml5:
-	free_page((unsigned long)pml4_root);
-err_pml4:
-	free_page((unsigned long)pae_root);
-	return -ENOMEM;
-#endif
-}
-
-static bool is_unsync_root(hpa_t root)
-{
-	struct kvm_mmu_page *sp;
-
-	if (!VALID_PAGE(root))
-		return false;
-
-	/*
-	 * The read barrier orders the CPU's read of SPTE.W during the page table
-	 * walk before the reads of sp->unsync/sp->unsync_children here.
-	 *
-	 * Even if another CPU was marking the SP as unsync-ed simultaneously,
-	 * any guest page table changes are not guaranteed to be visible anyway
-	 * until this VCPU issues a TLB flush strictly after those changes are
-	 * made.  We only need to ensure that the other CPU sets these flags
-	 * before any actual changes to the page tables are made.  The comments
-	 * in mmu_try_to_unsync_pages() describe what could go wrong if this
-	 * requirement isn't satisfied.
-	 */
-	smp_rmb();
-	sp = to_shadow_page(root);
-
-	/*
-	 * PAE roots (somewhat arbitrarily) aren't backed by shadow pages, the
-	 * PDPTEs for a given PAE root need to be synchronized individually.
-	 */
-	if (WARN_ON_ONCE(!sp))
-		return false;
-
-	if (sp->unsync || sp->unsync_children)
-		return true;
-
-	return false;
-}
-
-void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu)
-{
-	int i;
-	struct kvm_mmu_page *sp;
-
-	if (vcpu->arch.mmu->root_role.direct)
-		return;
-
-	if (!VALID_PAGE(vcpu->arch.mmu->root.hpa))
-		return;
-
-	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
-
-	if (vcpu->arch.mmu->cpu_role.base.level >= PT64_ROOT_4LEVEL) {
-		hpa_t root = vcpu->arch.mmu->root.hpa;
-		sp = to_shadow_page(root);
-
-		if (!is_unsync_root(root))
-			return;
-
-		write_lock(&vcpu->kvm->mmu_lock);
-		mmu_sync_children(vcpu, sp, true);
-		write_unlock(&vcpu->kvm->mmu_lock);
-		return;
-	}
-
-	write_lock(&vcpu->kvm->mmu_lock);
-
-	for (i = 0; i < 4; ++i) {
-		hpa_t root = vcpu->arch.mmu->pae_root[i];
-
-		if (IS_VALID_PAE_ROOT(root)) {
-			sp = spte_to_child_sp(root);
-			mmu_sync_children(vcpu, sp, true);
-		}
-	}
-
-	write_unlock(&vcpu->kvm->mmu_lock);
-}
-
-void kvm_mmu_sync_prev_roots(struct kvm_vcpu *vcpu)
-{
-	unsigned long roots_to_free = 0;
-	int i;
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
-		if (is_unsync_root(vcpu->arch.mmu->prev_roots[i].hpa))
-			roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
-
-	/* sync prev_roots by simply freeing them */
-	kvm_mmu_free_roots(vcpu->kvm, vcpu->arch.mmu, roots_to_free);
-}
-
-static gpa_t nonpaging_gva_to_gpa(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
-				  gpa_t vaddr, u64 access,
-				  struct x86_exception *exception)
-{
-	if (exception)
-		exception->error_code = 0;
-	return kvm_translate_gpa(vcpu, mmu, vaddr, access, exception);
-}
-
-static bool mmio_info_in_cache(struct kvm_vcpu *vcpu, u64 addr, bool direct)
-{
-	/*
-	 * A nested guest cannot use the MMIO cache if it is using nested
-	 * page tables, because cr2 is a nGPA while the cache stores GPAs.
-	 */
-	if (mmu_is_nested(vcpu))
-		return false;
-
-	if (direct)
-		return vcpu_match_mmio_gpa(vcpu, addr);
-
-	return vcpu_match_mmio_gva(vcpu, addr);
-}
-
-/*
- * Return the level of the lowest level SPTE added to sptes.
- * That SPTE may be non-present.
- *
- * Must be called between walk_shadow_page_lockless_{begin,end}.
- */
-static int get_walk(struct kvm_vcpu *vcpu, u64 addr, u64 *sptes, int *root_level)
-{
-	struct kvm_shadow_walk_iterator iterator;
-	int leaf = -1;
-	u64 spte;
-
-	for (shadow_walk_init(&iterator, vcpu, addr),
-	     *root_level = iterator.level;
-	     shadow_walk_okay(&iterator);
-	     __shadow_walk_next(&iterator, spte)) {
-		leaf = iterator.level;
-		spte = mmu_spte_get_lockless(iterator.sptep);
-
-		sptes[leaf] = spte;
-	}
-
-	return leaf;
-}
-
-/* return true if reserved bit(s) are detected on a valid, non-MMIO SPTE. */
-static bool get_mmio_spte(struct kvm_vcpu *vcpu, u64 addr, u64 *sptep)
-{
-	u64 sptes[PT64_ROOT_MAX_LEVEL + 1];
-	struct rsvd_bits_validate *rsvd_check;
-	int root, leaf, level;
-	bool reserved = false;
-
-	walk_shadow_page_lockless_begin(vcpu);
-
-	if (is_tdp_mmu_active(vcpu))
-		leaf = kvm_tdp_mmu_get_walk(vcpu, addr, sptes, &root);
-	else
-		leaf = get_walk(vcpu, addr, sptes, &root);
-
-	walk_shadow_page_lockless_end(vcpu);
-
-	if (unlikely(leaf < 0)) {
-		*sptep = 0ull;
-		return reserved;
-	}
-
-	*sptep = sptes[leaf];
-
-	/*
-	 * Skip reserved bits checks on the terminal leaf if it's not a valid
-	 * SPTE.  Note, this also (intentionally) skips MMIO SPTEs, which, by
-	 * design, always have reserved bits set.  The purpose of the checks is
-	 * to detect reserved bits on non-MMIO SPTEs. i.e. buggy SPTEs.
-	 */
-	if (!is_shadow_present_pte(sptes[leaf]))
-		leaf++;
-
-	rsvd_check = &vcpu->arch.mmu->shadow_zero_check;
-
-	for (level = root; level >= leaf; level--)
-		reserved |= is_rsvd_spte(rsvd_check, sptes[level], level);
-
-	if (reserved) {
-		pr_err("%s: reserved bits set on MMU-present spte, addr 0x%llx, hierarchy:\n",
-		       __func__, addr);
-		for (level = root; level >= leaf; level--)
-			pr_err("------ spte = 0x%llx level = %d, rsvd bits = 0x%llx",
-			       sptes[level], level,
-			       get_rsvd_bits(rsvd_check, sptes[level], level));
-	}
-
-	return reserved;
-}
-
-static int handle_mmio_page_fault(struct kvm_vcpu *vcpu, u64 addr, bool direct)
-{
-	u64 spte;
-	bool reserved;
-
-	if (mmio_info_in_cache(vcpu, addr, direct))
-		return RET_PF_EMULATE;
-
-	reserved = get_mmio_spte(vcpu, addr, &spte);
-	if (WARN_ON(reserved))
-		return -EINVAL;
-
-	if (is_mmio_spte(spte)) {
-		gfn_t gfn = get_mmio_spte_gfn(spte);
-		unsigned int access = get_mmio_spte_access(spte);
-
-		if (!check_mmio_spte(vcpu, spte))
-			return RET_PF_INVALID;
-
-		if (direct)
-			addr = 0;
-
-		trace_handle_mmio_page_fault(addr, gfn, access);
-		vcpu_cache_mmio_info(vcpu, addr, gfn, access);
-		return RET_PF_EMULATE;
-	}
-
-	/*
-	 * If the page table is zapped by other cpus, let CPU fault again on
-	 * the address.
-	 */
-	return RET_PF_RETRY;
-}
-
-static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
-					 struct kvm_page_fault *fault)
-{
-	if (unlikely(fault->rsvd))
-		return false;
-
-	if (!fault->present || !fault->write)
-		return false;
-
-	/*
-	 * guest is writing the page which is write tracked which can
-	 * not be fixed by page fault handler.
-	 */
-	if (kvm_slot_page_track_is_active(vcpu->kvm, fault->slot, fault->gfn, KVM_PAGE_TRACK_WRITE))
-		return true;
-
-	return false;
-}
-
-static void shadow_page_table_clear_flood(struct kvm_vcpu *vcpu, gva_t addr)
-{
-	struct kvm_shadow_walk_iterator iterator;
-	u64 spte;
-
-	walk_shadow_page_lockless_begin(vcpu);
-	for_each_shadow_entry_lockless(vcpu, addr, iterator, spte)
-		clear_sp_write_flooding_count(iterator.sptep);
-	walk_shadow_page_lockless_end(vcpu);
-}
-
-static u32 alloc_apf_token(struct kvm_vcpu *vcpu)
-{
-	/* make sure the token value is not 0 */
-	u32 id = vcpu->arch.apf.id;
-
-	if (id << 12 == 0)
-		vcpu->arch.apf.id = 1;
-
-	return (vcpu->arch.apf.id++ << 12) | vcpu->vcpu_id;
-}
-
-static bool kvm_arch_setup_async_pf(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
-				    gfn_t gfn)
-{
-	struct kvm_arch_async_pf arch;
-
-	arch.token = alloc_apf_token(vcpu);
-	arch.gfn = gfn;
-	arch.direct_map = vcpu->arch.mmu->root_role.direct;
-	arch.cr3 = kvm_mmu_get_guest_pgd(vcpu, vcpu->arch.mmu);
-
-	return kvm_setup_async_pf(vcpu, cr2_or_gpa,
-				  kvm_vcpu_gfn_to_hva(vcpu, gfn), &arch);
-}
-
-void kvm_arch_async_page_ready(struct kvm_vcpu *vcpu, struct kvm_async_pf *work)
-{
-	int r;
-
-	if ((vcpu->arch.mmu->root_role.direct != work->arch.direct_map) ||
-	      work->wakeup_all)
-		return;
-
-	r = kvm_mmu_reload(vcpu);
-	if (unlikely(r))
-		return;
-
-	if (!vcpu->arch.mmu->root_role.direct &&
-	      work->arch.cr3 != kvm_mmu_get_guest_pgd(vcpu, vcpu->arch.mmu))
-		return;
-
-	kvm_mmu_do_page_fault(vcpu, work->cr2_or_gpa, 0, true, NULL);
-}
-
-static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
-{
-	struct kvm_memory_slot *slot = fault->slot;
-	bool async;
-
-	/*
-	 * Retry the page fault if the gfn hit a memslot that is being deleted
-	 * or moved.  This ensures any existing SPTEs for the old memslot will
-	 * be zapped before KVM inserts a new MMIO SPTE for the gfn.
-	 */
-	if (slot && (slot->flags & KVM_MEMSLOT_INVALID))
-		return RET_PF_RETRY;
-
-	if (!kvm_is_visible_memslot(slot)) {
-		/* Don't expose private memslots to L2. */
-		if (is_guest_mode(vcpu)) {
-			fault->slot = NULL;
-			fault->pfn = KVM_PFN_NOSLOT;
-			fault->map_writable = false;
-			return RET_PF_CONTINUE;
-		}
-		/*
-		 * If the APIC access page exists but is disabled, go directly
-		 * to emulation without caching the MMIO access or creating a
-		 * MMIO SPTE.  That way the cache doesn't need to be purged
-		 * when the AVIC is re-enabled.
-		 */
-		if (slot && slot->id == APIC_ACCESS_PAGE_PRIVATE_MEMSLOT &&
-		    !kvm_apicv_activated(vcpu->kvm))
-			return RET_PF_EMULATE;
-	}
-
-	async = false;
-	fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, false, &async,
-					  fault->write, &fault->map_writable,
-					  &fault->hva);
-	if (!async)
-		return RET_PF_CONTINUE; /* *pfn has correct page already */
-
-	if (!fault->prefetch && kvm_can_do_async_pf(vcpu)) {
-		trace_kvm_try_async_get_page(fault->addr, fault->gfn);
-		if (kvm_find_async_pf_gfn(vcpu, fault->gfn)) {
-			trace_kvm_async_pf_repeated_fault(fault->addr, fault->gfn);
-			kvm_make_request(KVM_REQ_APF_HALT, vcpu);
-			return RET_PF_RETRY;
-		} else if (kvm_arch_setup_async_pf(vcpu, fault->addr, fault->gfn)) {
-			return RET_PF_RETRY;
-		}
-	}
-
-	/*
-	 * Allow gup to bail on pending non-fatal signals when it's also allowed
-	 * to wait for IO.  Note, gup always bails if it is unable to quickly
-	 * get a page and a fatal signal, i.e. SIGKILL, is pending.
-	 */
-	fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, true, NULL,
-					  fault->write, &fault->map_writable,
-					  &fault->hva);
-	return RET_PF_CONTINUE;
-}
-
-static int kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault,
-			   unsigned int access)
-{
-	int ret;
-
-	fault->mmu_seq = vcpu->kvm->mmu_invalidate_seq;
-	smp_rmb();
-
-	ret = __kvm_faultin_pfn(vcpu, fault);
-	if (ret != RET_PF_CONTINUE)
-		return ret;
-
-	if (unlikely(is_error_pfn(fault->pfn)))
-		return kvm_handle_error_pfn(vcpu, fault);
-
-	if (unlikely(!fault->slot))
-		return kvm_handle_noslot_fault(vcpu, fault, access);
-
-	return RET_PF_CONTINUE;
-}
-
-/*
- * Returns true if the page fault is stale and needs to be retried, i.e. if the
- * root was invalidated by a memslot update or a relevant mmu_notifier fired.
- */
-static bool is_page_fault_stale(struct kvm_vcpu *vcpu,
-				struct kvm_page_fault *fault)
-{
-	struct kvm_mmu_page *sp = to_shadow_page(vcpu->arch.mmu->root.hpa);
-
-	/* Special roots, e.g. pae_root, are not backed by shadow pages. */
-	if (sp && is_obsolete_sp(vcpu->kvm, sp))
-		return true;
-
-	/*
-	 * Roots without an associated shadow page are considered invalid if
-	 * there is a pending request to free obsolete roots.  The request is
-	 * only a hint that the current root _may_ be obsolete and needs to be
-	 * reloaded, e.g. if the guest frees a PGD that KVM is tracking as a
-	 * previous root, then __kvm_mmu_prepare_zap_page() signals all vCPUs
-	 * to reload even if no vCPU is actively using the root.
-	 */
-	if (!sp && kvm_test_request(KVM_REQ_MMU_FREE_OBSOLETE_ROOTS, vcpu))
-		return true;
-
-	return fault->slot &&
-	       mmu_invalidate_retry_hva(vcpu->kvm, fault->mmu_seq, fault->hva);
-}
-
-static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
-{
-	int r;
-
-	if (page_fault_handle_page_track(vcpu, fault))
-		return RET_PF_EMULATE;
-
-	r = fast_page_fault(vcpu, fault);
-	if (r != RET_PF_INVALID)
-		return r;
-
-	r = mmu_topup_memory_caches(vcpu, false);
-	if (r)
-		return r;
-
-	r = kvm_faultin_pfn(vcpu, fault, ACC_ALL);
-	if (r != RET_PF_CONTINUE)
-		return r;
-
-	r = RET_PF_RETRY;
-	write_lock(&vcpu->kvm->mmu_lock);
-
-	if (is_page_fault_stale(vcpu, fault))
-		goto out_unlock;
-
-	r = make_mmu_pages_available(vcpu);
-	if (r)
-		goto out_unlock;
-
-	r = direct_map(vcpu, fault);
-
-out_unlock:
-	write_unlock(&vcpu->kvm->mmu_lock);
-	kvm_release_pfn_clean(fault->pfn);
-	return r;
-}
-
-static int nonpaging_page_fault(struct kvm_vcpu *vcpu,
-				struct kvm_page_fault *fault)
-{
-	pgprintk("%s: gva %lx error %x\n", __func__, fault->addr, fault->error_code);
-
-	/* This path builds a PAE pagetable, we can map 2mb pages at maximum. */
-	fault->max_level = PG_LEVEL_2M;
-	return direct_page_fault(vcpu, fault);
-}
-
-int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
-				u64 fault_address, char *insn, int insn_len)
-{
-	int r = 1;
-	u32 flags = vcpu->arch.apf.host_apf_flags;
-
-#ifndef CONFIG_X86_64
-	/* A 64-bit CR2 should be impossible on 32-bit KVM. */
-	if (WARN_ON_ONCE(fault_address >> 32))
+	if (!kvm_slot_can_be_private(fault->slot)) {
+		kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
 		return -EFAULT;
-#endif
-
-	vcpu->arch.l1tf_flush_l1d = true;
-	if (!flags) {
-		trace_kvm_page_fault(vcpu, fault_address, error_code);
-
-		if (kvm_event_needs_reinjection(vcpu))
-			kvm_mmu_unprotect_page_virt(vcpu, fault_address);
-		r = kvm_mmu_page_fault(vcpu, fault_address, error_code, insn,
-				insn_len);
-	} else if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
-		vcpu->arch.apf.host_apf_flags = 0;
-		local_irq_disable();
-		kvm_async_pf_task_wait_schedule(fault_address);
-		local_irq_enable();
-	} else {
-		WARN_ONCE(1, "Unexpected host async PF flags: %x\n", flags);
 	}
 
-	return r;
-}
-EXPORT_SYMBOL_GPL(kvm_handle_page_fault);
-
-#ifdef CONFIG_X86_64
-static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
-				  struct kvm_page_fault *fault)
-{
-	int r;
-
-	if (page_fault_handle_page_track(vcpu, fault))
-		return RET_PF_EMULATE;
-
-	r = fast_page_fault(vcpu, fault);
-	if (r != RET_PF_INVALID)
+	r = kvm_gmem_get_pfn                                   , &fault->pfn,
+			     &max_order);
+	if (r) {
+		kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
 		return r;
+	}
+                     min(kvm_max_level_for_order(max_order),
+			       fault->max_level);
+                       !(fault->slot->flags & KVM_MEM_READONLY);
 
-	r = mmu_topup_memory_caches(vcpu, false);
-	if (r)
-		return r;
-
-	r = kvm_faultin_pfn(vcpu, fault, ACC_ALL);
-	if (r != RET_PF_CONTINUE)
-		return r;
-
-	r = RET_PF_RETRY;
-	read_lock(&vcpu->kvm->mmu_lock);
-
-	if (is_page_fault_stale(vcpu, fault))
-		goto out_unlock;
-
-	r = kvm_tdp_mmu_map(vcpu, fault);
-
-out_unlock:
-	read_unlock(&vcpu->kvm->mmu_lock);
-	kvm_release_pfn_clean(fault->pfn);
-	return r;
-}
-#endif
-
-int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
-{
-	/*
-	 * If the guest's MTRRs may be used to compute the "real" memtype,
-	 * restrict the mapping level to ensure KVM uses a consistent memtype
-	 * across the entire mapping.  If the host MTRRs are ignored by TDP
-	 * (shadow_memtype_mask is non-zero), and the VM has non-coherent DMA
-	 * (DMA doesn't snoop CPU caches), KVM's ABI is to honor the memtype
-	 * from the guest's MTRRs so that guest accesses to memory that is
-	 * DMA'd aren't cached against the guest's wishes.
-	 *
-	 * Note, KVM may still ultimately ignore guest MTRRs for certain PFNs,
-	 * e.g. KVM will force UC memtype for host MMIO.
-	 */
-	if (shadow_memtype_mask && kvm_arch_has_noncoherent_dma(vcpu->kvm)) {
-		for ( ; fault->max_level > PG_LEVEL_4K; --fault->max_level) {
-			int page_num = KVM_PAGES_PER_HPAGE(fault->max_level);
-			gfn_t base = gfn_round_for_level(fault->gfn,
-							 fault->max_level);
-
-			if (kvm_mtrr_check_gfn_range_consistency(vcpu, base, page_num))
-				break;
-		}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  if (fault->is_private != kvm_mem_is_private(vcpu->kvm, fault->gfn)) {
+		kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
+		return -EFAULT;
 	}
 
-#ifdef CONFIG_X86_64
-	if (tdp_mmu_enabled)
-		return kvm_tdp_mmu_page_fault(vcpu, fault);
-#endif
-
-	return direct_page_fault(vcpu, fault);
-}
-
-static void nonpaging_init_context(struct kvm_mmu *context)
-{
-	context->page_fault = nonpaging_page_fault;
-	context->gva_to_gpa = nonpaging_gva_to_gpa;
-	context->sync_spte = NULL;
-}
-
-static inline bool is_root_usable(struct kvm_mmu_root_info *root, gpa_t pgd,
-				  union kvm_mmu_page_role role)
-{
-	return (role.direct || pgd == root->pgd) &&
-	       VALID_PAGE(root->hpa) &&
-	       role.word == to_shadow_page(root->hpa)->role.word;
-}
-
-/*
- * Find out if a previously cached root matching the new pgd/role is available,
- * and insert the current root as the MRU in the cache.
- * If a matching root is found, it is assigned to kvm_mmu->root and
- * true is returned.
- * If no match is found, kvm_mmu->root is left invalid, the LRU root is
- * evicted to make room for the current root, and false is returned.
- */
-static bool cached_root_find_and_keep_current(struct kvm *kvm, struct kvm_mmu *mmu,
-					      gpa_t new_pgd,
-					      union kvm_mmu_page_role new_role)
-{
-	uint i;
-
-	if (is_root_usable(&mmu->root, new_pgd, new_role))
-		return true;
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
-		/*
-		 * The swaps end up rotating the cache like this:
-		 *   C   0 1 2 3   (on entry to the function)
-		 *   0   C 1 2 3
-		 *   1   C 0 2 3
-		 *   2   C 0 1 3
-		 *   3   C 0 1 2   (on exit from the loop)
-		 */
-		swap(mmu->root, mmu->prev_roots[i]);
-		if (is_root_usable(&mmu->root, new_pgd, new_role))
-			return true;
-	}
-
-	kvm_mmu_free_roots(kvm, mmu, KVM_MMU_ROOT_CURRENT);
-	return false;
-}
-
-/*
- * Find out if a previously cached root matching the new pgd/role is available.
- * On entry, mmu->root is invalid.
- * If a matching root is found, it is assigned to kvm_mmu->root, the LRU entry
- * of the cache becomes invalid, and true is returned.
- * If no match is found, kvm_mmu->root is left invalid and false is returned.
- */
-static bool cached_root_find_without_current(struct kvm *kvm, struct kvm_mmu *mmu,
-					     gpa_t new_pgd,
-					     union kvm_mmu_page_role new_role)
-{
-	uint i;
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
-		if (is_root_usable(&mmu->prev_roots[i], new_pgd, new_role))
-			goto hit;
-
-	return false;
-
-hit:
-	swap(mmu->root, mmu->prev_roots[i]);
-	/* Bubble up the remaining roots.  */
-	for (; i < KVM_MMU_NUM_PREV_ROOTS - 1; i++)
-		mmu->prev_roots[i] = mmu->prev_roots[i + 1];
-	mmu->prev_roots[i].hpa = INVALID_PAGE;
-	return true;
-}
-
-static bool fast_pgd_switch(struct kvm *kvm, struct kvm_mmu *mmu,
-			    gpa_t new_pgd, union kvm_mmu_page_role new_role)
+	if (fault->is_private)
+		return kvm_faultin_pfn_private(vcpu, fault);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              gfn                                   gfn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     bool __kvm_mmu_honors_guest_mtrrs(bool vm_has_noncoherent_dma)
 {
 	/*
-	 * For now, limit the caching to 64-bit hosts+VMs in order to avoid
-	 * having to deal with PDPTEs. We may add support for 32-bit hosts/VMs
-	 * later if necessary.
+	 * If host MTRRs are ignored                                           
+	 * VM has non-coherent DMA                                             
+	 *                                                                   
+	 * to memory that is                                                                                                                                                                                     return vm_has_noncoherent_dma && shadow_memtype_mask;
+}                                                                                                                                                                                                                                                             
 	 */
-	if (VALID_PAGE(mmu->root.hpa) && !to_shadow_page(mmu->root.hpa))
-		kvm_mmu_free_roots(kvm, mmu, KVM_MMU_ROOT_CURRENT);
-
-	if (VALID_PAGE(mmu->root.hpa))
-		return cached_root_find_and_keep_current(kvm, mmu, new_pgd, new_role);
-	else
-		return cached_root_find_without_current(kvm, mmu, new_pgd, new_role);
-}
-
-void kvm_mmu_new_pgd(struct kvm_vcpu *vcpu, gpa_t new_pgd)
-{
-	struct kvm_mmu *mmu = vcpu->arch.mmu;
-	union kvm_mmu_page_role new_role = mmu->root_role;
-
-	/*
-	 * Return immediately if no usable root was found, kvm_mmu_reload()
-	 * will establish a valid root prior to the next VM-Enter.
-	 */
-	if (!fast_pgd_switch(vcpu->kvm, mmu, new_pgd, new_role))
-		return;
-
-	/*
-	 * It's possible that the cached previous root page is obsolete because
-	 * of a change in the MMU generation number. However, changing the
-	 * generation number is accompanied by KVM_REQ_MMU_FREE_OBSOLETE_ROOTS,
-	 * which will free the root set here and allocate a new one.
-	 */
-	kvm_make_request(KVM_REQ_LOAD_MMU_PGD, vcpu);
-
-	if (force_flush_and_sync_on_reuse) {
-		kvm_make_request(KVM_REQ_MMU_SYNC, vcpu);
-		kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, vcpu);
-	}
-
-	/*
-	 * The last MMIO access's GVA and GPA are cached in the VCPU. When
-	 * switching to a new CR3, that GVA->GPA mapping may no longer be
-	 * valid. So clear any cached MMIO info even when we don't need to sync
-	 * the shadow page tables.
-	 */
-	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
-
-	/*
-	 * If this is a direct root page, it doesn't have a write flooding
-	 * count. Otherwise, clear the write flooding count.
-	 */
-	if (!new_role.direct)
-		__clear_sp_write_flooding_count(
-				to_shadow_page(vcpu->arch.mmu->root.hpa));
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_new_pgd);
-
-static bool sync_mmio_spte(struct kvm_vcpu *vcpu, u64 *sptep, gfn_t gfn,
-			   unsigned int access)
-{
-	if (unlikely(is_mmio_spte(*sptep))) {
-		if (gfn != get_mmio_spte_gfn(*sptep)) {
-			mmu_spte_clear_no_track(sptep);
-			return true;
-		}
-
-		mark_mmio_spte(vcpu, sptep, gfn, access);
-		return true;
-	}
-
-	return false;
-}
-
-#define PTTYPE_EPT 18 /* arbitrary */
-#define PTTYPE PTTYPE_EPT
-#include "paging_tmpl.h"
-#undef PTTYPE
-
-#define PTTYPE 64
-#include "paging_tmpl.h"
-#undef PTTYPE
-
-#define PTTYPE 32
-#include "paging_tmpl.h"
-#undef PTTYPE
-
-static void __reset_rsvds_bits_mask(struct rsvd_bits_validate *rsvd_check,
-				    u64 pa_bits_rsvd, int level, bool nx,
-				    bool gbpages, bool pse, bool amd)
-{
-	u64 gbpages_bit_rsvd = 0;
-	u64 nonleaf_bit8_rsvd = 0;
-	u64 high_bits_rsvd;
-
-	rsvd_check->bad_mt_xwr = 0;
-
-	if (!gbpages)
-		gbpages_bit_rsvd = rsvd_bits(7, 7);
-
-	if (level == PT32E_ROOT_LEVEL)
-		high_bits_rsvd = pa_bits_rsvd & rsvd_bits(0, 62);
-	else
-		high_bits_rsvd = pa_bits_rsvd & rsvd_bits(0, 51);
-
-	/* Note, NX doesn't exist in PDPTEs, this is handled below. */
-	if (!nx)
-		high_bits_rsvd |= rsvd_bits(63, 63);
-
-	/*
-	 * Non-leaf PML4Es and PDPEs reserve bit 8 (which would be the G bit for
-	 * leaf entries) on AMD CPUs only.
-	 */
-	if (amd)
-		nonleaf_bit8_rsvd = rsvd_bits(8, 8);
-
-	switch (level) {
-	case PT32_ROOT_LEVEL:
-		/* no rsvd bits for 2 level 4K page table entries */
-		rsvd_check->rsvd_bits_mask[0][1] = 0;
-		rsvd_check->rsvd_bits_mask[0][0] = 0;
-		rsvd_check->rsvd_bits_mask[1][0] =
-			rsvd_check->rsvd_bits_mask[0][0];
-
-		if (!pse) {
-			rsvd_check->rsvd_bits_mask[1][1] = 0;
-			break;
-		}
-
-		if (is_cpuid_PSE36())
-			/* 36bits PSE 4MB page */
-			rsvd_check->rsvd_bits_mask[1][1] = rsvd_bits(17, 21);
-		else
-			/* 32 bits PSE 4MB page */
-			rsvd_check->rsvd_bits_mask[1][1] = rsvd_bits(13, 21);
-		break;
-	case PT32E_ROOT_LEVEL:
-		rsvd_check->rsvd_bits_mask[0][2] = rsvd_bits(63, 63) |
-						   high_bits_rsvd |
-						   rsvd_bits(5, 8) |
-						   rsvd_bits(1, 2);	/* PDPTE */
-		rsvd_check->rsvd_bits_mask[0][1] = high_bits_rsvd;	/* PDE */
-		rsvd_check->rsvd_bits_mask[0][0] = high_bits_rsvd;	/* PTE */
-		rsvd_check->rsvd_bits_mask[1][1] = high_bits_rsvd |
-						   rsvd_bits(13, 20);	/* large page */
-		rsvd_check->rsvd_bits_mask[1][0] =
-			rsvd_check->rsvd_bits_mask[0][0];
-		break;
-	case PT64_ROOT_5LEVEL:
-		rsvd_check->rsvd_bits_mask[0][4] = high_bits_rsvd |
-						   nonleaf_bit8_rsvd |
-						   rsvd_bits(7, 7);
-		rsvd_check->rsvd_bits_mask[1][4] =
-			rsvd_check->rsvd_bits_mask[0][4];
-		fallthrough;
-	case PT64_ROOT_4LEVEL:
-		rsvd_check->rsvd_bits_mask[0][3] = high_bits_rsvd |
-						   nonleaf_bit8_rsvd |
-						   rsvd_bits(7, 7);
-		rsvd_check->rsvd_bits_mask[0][2] = high_bits_rsvd |
-						   gbpages_bit_rsvd;
-		rsvd_check->rsvd_bits_mask[0][1] = high_bits_rsvd;
-		rsvd_check->rsvd_bits_mask[0][0] = high_bits_rsvd;
-		rsvd_check->rsvd_bits_mask[1][3] =
-			rsvd_check->rsvd_bits_mask[0][3];
-		rsvd_check->rsvd_bits_mask[1][2] = high_bits_rsvd |
-						   gbpages_bit_rsvd |
-						   rsvd_bits(13, 29);
-		rsvd_check->rsvd_bits_mask[1][1] = high_bits_rsvd |
-						   rsvd_bits(13, 20); /* large page */
-		rsvd_check->rsvd_bits_mask[1][0] =
-			rsvd_check->rsvd_bits_mask[0][0];
-		break;
-	}
-}
-
-static bool guest_can_use_gbpages(struct kvm_vcpu *vcpu)
-{
-	/*
-	 * If TDP is enabled, let the guest use GBPAGES if they're supported in
-	 * hardware.  The hardware page walker doesn't let KVM disable GBPAGES,
-	 * i.e. won't treat them as reserved, and KVM doesn't redo the GVA->GPA
-	 * walk for performance and complexity reasons.  Not to mention KVM
-	 * _can't_ solve the problem because GVA->GPA walks aren't visible to
-	 * KVM once a TDP translation is installed.  Mimic hardware behavior so
-	 * that KVM's is at least consistent, i.e. doesn't randomly inject #PF.
-	 */
-	return tdp_enabled ? boot_cpu_has(X86_FEATURE_GBPAGES) :
-			     guest_cpuid_has(vcpu, X86_FEATURE_GBPAGES);
-}
-
-static void reset_guest_rsvds_bits_mask(struct kvm_vcpu *vcpu,
-					struct kvm_mmu *context)
-{
-	__reset_rsvds_bits_mask(&context->guest_rsvd_check,
-				vcpu->arch.reserved_gpa_bits,
-				context->cpu_role.base.level, is_efer_nx(context),
-				guest_can_use_gbpages(vcpu),
-				is_cr4_pse(context),
-				guest_cpuid_is_amd_or_hygon(vcpu));
-}
-
-static void __reset_rsvds_bits_mask_ept(struct rsvd_bits_validate *rsvd_check,
-					u64 pa_bits_rsvd, bool execonly,
-					int huge_page_level)
-{
-	u64 high_bits_rsvd = pa_bits_rsvd & rsvd_bits(0, 51);
-	u64 large_1g_rsvd = 0, large_2m_rsvd = 0;
-	u64 bad_mt_xwr;
-
-	if (huge_page_level < PG_LEVEL_1G)
-		large_1g_rsvd = rsvd_bits(7, 7);
-	if (huge_page_level < PG_LEVEL_2M)
-		large_2m_rsvd = rsvd_bits(7, 7);
-
-	rsvd_check->rsvd_bits_mask[0][4] = high_bits_rsvd | rsvd_bits(3, 7);
-	rsvd_check->rsvd_bits_mask[0][3] = high_bits_rsvd | rsvd_bits(3, 7);
-	rsvd_check->rsvd_bits_mask[0][2] = high_bits_rsvd | rsvd_bits(3, 6) | large_1g_rsvd;
-	rsvd_check->rsvd_bits_mask[0][1] = high_bits_rsvd | rsvd_bits(3, 6) | large_2m_rsvd;
-	rsvd_check->rsvd_bits_mask[0][0] = high_bits_rsvd;
-
-	/* large page */
-	rsvd_check->rsvd_bits_mask[1][4] = rsvd_check->rsvd_bits_mask[0][4];
-	rsvd_check->rsvd_bits_mask[1][3] = rsvd_check->rsvd_bits_mask[0][3];
-	rsvd_check->rsvd_bits_mask[1][2] = high_bits_rsvd | rsvd_bits(12, 29) | large_1g_rsvd;
-	rsvd_check->rsvd_bits_mask[1][1] = high_bits_rsvd | rsvd_bits(12, 20) | large_2m_rsvd;
-	rsvd_check->rsvd_bits_mask[1][0] = rsvd_check->rsvd_bits_mask[0][0];
-
-	bad_mt_xwr = 0xFFull << (2 * 8);	/* bits 3..5 must not be 2 */
-	bad_mt_xwr |= 0xFFull << (3 * 8);	/* bits 3..5 must not be 3 */
-	bad_mt_xwr |= 0xFFull << (7 * 8);	/* bits 3..5 must not be 7 */
-	bad_mt_xwr |= REPEAT_BYTE(1ull << 2);	/* bits 0..2 must not be 010 */
-	bad_mt_xwr |= REPEAT_BYTE(1ull << 6);	/* bits 0..2 must not be 110 */
-	if (!execonly) {
-		/* bits 0..2 must not be 100 unless VMX capabilities allow it */
-		bad_mt_xwr |= REPEAT_BYTE(1ull << 4);
-	}
-	rsvd_check->bad_mt_xwr = bad_mt_xwr;
-}
-
-static void reset_rsvds_bits_mask_ept(struct kvm_vcpu *vcpu,
-		struct kvm_mmu *context, bool execonly, int huge_page_level)
-{
-	__reset_rsvds_bits_mask_ept(&context->guest_rsvd_check,
-				    vcpu->arch.reserved_gpa_bits, execonly,
-				    huge_page_level);
-}
-
-static inline u64 reserved_hpa_bits(void)
-{
-	return rsvd_bits(shadow_phys_bits, 63);
-}
-
-/*
- * the page table on host is the shadow page table for the page
- * table in guest or amd nested guest, its mmu features completely
- * follow the features in guest.
- */
-static void reset_shadow_zero_bits_mask(struct kvm_vcpu *vcpu,
-					struct kvm_mmu *context)
-{
-	/* @amd adds a check on bit of SPTEs, which KVM shouldn't use anyways. */
-	bool is_amd = true;
-	/* KVM doesn't use 2-level page tables for the shadow MMU. */
-	bool is_pse = false;
-	struct rsvd_bits_validate *shadow_zero_check;
-	int i;
-
-	WARN_ON_ONCE(context->root_role.level < PT32E_ROOT_LEVEL);
-
-	shadow_zero_check = &context->shadow_zero_check;
-	__reset_rsvds_bits_mask(shadow_zero_check, reserved_hpa_bits(),
-				context->root_role.level,
-				context->root_role.efer_nx,
-				guest_can_use_gbpages(vcpu), is_pse, is_amd);
-
-	if (!shadow_me_mask)
-		return;
-
-	for (i = context->root_role.level; --i >= 0;) {
-		/*
-		 * So far shadow_me_value is a constant during KVM's life
-		 * time.  Bits in shadow_me_value are allowed to be set.
-		 * Bits in shadow_me_mask but not in shadow_me_value are
-		 * not allowed to be set.
-		 */
-		shadow_zero_check->rsvd_bits_mask[0][i] |= shadow_me_mask;
-		shadow_zero_check->rsvd_bits_mask[1][i] |= shadow_me_mask;
-		shadow_zero_check->rsvd_bits_mask[0][i] &= ~shadow_me_value;
-		shadow_zero_check->rsvd_bits_mask[1][i] &= ~shadow_me_value;
-	}
-
-}
-
-static inline bool boot_cpu_is_amd(void)
-{
-	WARN_ON_ONCE(!tdp_enabled);
-	return shadow_x_mask == 0;
-}
-
-/*
- * the direct page table on host, use as much mmu features as
- * possible, however, kvm currently does not do execution-protection.
- */
-static void reset_tdp_shadow_zero_bits_mask(struct kvm_mmu *context)
-{
-	struct rsvd_bits_validate *shadow_zero_check;
-	int i;
-
-	shadow_zero_check = &context->shadow_zero_check;
-
-	if (boot_cpu_is_amd())
-		__reset_rsvds_bits_mask(shadow_zero_check, reserved_hpa_bits(),
-					context->root_role.level, true,
-					boot_cpu_has(X86_FEATURE_GBPAGES),
-					false, true);
-	else
-		__reset_rsvds_bits_mask_ept(shadow_zero_check,
-					    reserved_hpa_bits(), false,
-					    max_huge_page_level);
-
-	if (!shadow_me_mask)
-		return;
-
-	for (i = context->root_role.level; --i >= 0;) {
-		shadow_zero_check->rsvd_bits_mask[0][i] &= ~shadow_me_mask;
-		shadow_zero_check->rsvd_bits_mask[1][i] &= ~shadow_me_mask;
-	}
-}
-
-/*
- * as the comments in reset_shadow_zero_bits_mask() except it
- * is the shadow page table for intel nested guest.
- */
-static void
-reset_ept_shadow_zero_bits_mask(struct kvm_mmu *context, bool execonly)
-{
-	__reset_rsvds_bits_mask_ept(&context->shadow_zero_check,
-				    reserved_hpa_bits(), execonly,
-				    max_huge_page_level);
-}
-
-#define BYTE_MASK(access) \
-	((1 & (access) ? 2 : 0) | \
-	 (2 & (access) ? 4 : 0) | \
-	 (3 & (access) ? 8 : 0) | \
-	 (4 & (access) ? 16 : 0) | \
-	 (5 & (access) ? 32 : 0) | \
-	 (6 & (access) ? 64 : 0) | \
-	 (7 & (access) ? 128 : 0))
-
-
-static void update_permission_bitmask(struct kvm_mmu *mmu, bool ept)
-{
-	unsigned byte;
-
-	const u8 x = BYTE_MASK(ACC_EXEC_MASK);
-	const u8 w = BYTE_MASK(ACC_WRITE_MASK);
-	const u8 u = BYTE_MASK(ACC_USER_MASK);
-
-	bool cr4_smep = is_cr4_smep(mmu);
-	bool cr4_smap = is_cr4_smap(mmu);
-	bool cr0_wp = is_cr0_wp(mmu);
-	bool efer_nx = is_efer_nx(mmu);
-
-	for (byte = 0; byte < ARRAY_SIZE(mmu->permissions); ++byte) {
-		unsigned pfec = byte << 1;
-
-		/*
-		 * Each "*f" variable has a 1 bit for each UWX value
-		 * that causes a fault with the given PFEC.
-		 */
-
-		/* Faults from writes to non-writable pages */
-		u8 wf = (pfec & PFERR_WRITE_MASK) ? (u8)~w : 0;
-		/* Faults from user mode accesses to supervisor pages */
-		u8 uf = (pfec & PFERR_USER_MASK) ? (u8)~u : 0;
-		/* Faults from fetches of non-executable pages*/
-		u8 ff = (pfec & PFERR_FETCH_MASK) ? (u8)~x : 0;
-		/* Faults from kernel mode fetches of user pages */
-		u8 smepf = 0;
-		/* Faults from kernel mode accesses of user pages */
-		u8 smapf = 0;
-
-		if (!ept) {
-			/* Faults from kernel mode accesses to user pages */
-			u8 kf = (pfec & PFERR_USER_MASK) ? 0 : u;
-
-			/* Not really needed: !nx will cause pte.nx to fault */
-			if (!efer_nx)
-				ff = 0;
-
-			/* Allow supervisor writes if !cr0.wp */
-			if (!cr0_wp)
-				wf = (pfec & PFERR_USER_MASK) ? wf : 0;
-
-			/* Disallow supervisor fetches of user code if cr4.smep */
-			if (cr4_smep)
-				smepf = (pfec & PFERR_FETCH_MASK) ? kf : 0;
-
-			/*
-			 * SMAP:kernel-mode data accesses from user-mode
-			 * mappings should fault. A fault is considered
-			 * as a SMAP violation if all of the following
-			 * conditions are true:
-			 *   - X86_CR4_SMAP is set in CR4
-			 *   - A user page is accessed
-			 *   - The access is not a fetch
-			 *   - The access is supervisor mode
-			 *   - If implicit supervisor access or X86_EFLAGS_AC is clear
-			 *
-			 * Here, we cover the first four conditions.
-			 * The fifth is computed dynamically in permission_fault();
-			 * PFERR_RSVD_MASK bit will be set in PFEC if the access is
-			 * *not* subject to SMAP restrictions.
-			 */
-			if (cr4_smap)
-				smapf = (pfec & (PFERR_RSVD_MASK|PFERR_FETCH_MASK)) ? 0 : kf;
-		}
-
-		mmu->permissions[byte] = ff | uf | wf | smepf | smapf;
-	}
-}
-
-/*
-* PKU is an additional mechanism by which the paging controls access to
-* user-mode addresses based on the value in the PKRU register.  Protection
-* key violations are reported through a bit in the page fault error code.
-* Unlike other bits of the error code, the PK bit is not known at the
-* call site of e.g. gva_to_gpa; it must be computed directly in
-* permission_fault based on two bits of PKRU, on some machine state (CR4,
-* CR0, EFER, CPL), and on other bits of the error code and the page tables.
-*
-* In particular the following conditions come from the error code, the
-* page tables and the machine state:
-* - PK is always zero unless CR4.PKE=1 and EFER.LMA=1
-* - PK is always zero if RSVD=1 (reserved bit set) or F=1 (instruction fetch)
-* - PK is always zero if U=0 in the page tables
-* - PKRU.WD is ignored if CR0.WP=0 and the access is a supervisor access.
-*
-* The PKRU bitmask caches the result of these four conditions.  The error
-* code (minus the P bit) and the page table's U bit form an index into the
-* PKRU bitmask.  Two bits of the PKRU bitmask are then extracted and ANDed
-* with the two bits of the PKRU register corresponding to the protection key.
-* For the first three conditions above the bits will be 00, thus masking
-* away both AD and WD.  For all reads or if the last condition holds, WD
-* only will be masked away.
-*/
-static void update_pkru_bitmask(struct kvm_mmu *mmu)
-{
-	unsigned bit;
-	bool wp;
-
-	mmu->pkru_mask = 0;
-
-	if (!is_cr4_pke(mmu))
-		return;
-
-	wp = is_cr0_wp(mmu);
-
-	for (bit = 0; bit < ARRAY_SIZE(mmu->permissions); ++bit) {
-		unsigned pfec, pkey_bits;
-		bool check_pkey, check_write, ff, uf, wf, pte_user;
-
-		pfec = bit << 1;
-		ff = pfec & PFERR_FETCH_MASK;
-		uf = pfec & PFERR_USER_MASK;
-		wf = pfec & PFERR_WRITE_MASK;
-
-		/* PFEC.RSVD is replaced by ACC_USER_MASK. */
-		pte_user = pfec & PFERR_RSVD_MASK;
-
-		/*
-		 * Only need to check the access which is not an
-		 * instruction fetch and is to a user page.
-		 */
-		check_pkey = (!ff && pte_user);
-		/*
-		 * write access is controlled by PKRU if it is a
-		 * user access or CR0.WP = 1.
-		 */
-		check_write = check_pkey && wf && (uf || wp);
-
-		/* PKRU.AD stops both read and write access. */
-		pkey_bits = !!check_pkey;
-		/* PKRU.WD stops write access. */
-		pkey_bits |= (!!check_write) << 1;
-
-		mmu->pkru_mask |= (pkey_bits & 3) << pfec;
-	}
-}
-
-static void reset_guest_paging_metadata(struct kvm_vcpu *vcpu,
-					struct kvm_mmu *mmu)
-{
-	if (!is_cr0_pg(mmu))
-		return;
-
-	reset_guest_rsvds_bits_mask(vcpu, mmu);
-	update_permission_bitmask(mmu, false);
-	update_pkru_bitmask(mmu);
-}
-
-static void paging64_init_context(struct kvm_mmu *context)
-{
-	context->page_fault = paging64_page_fault;
-	context->gva_to_gpa = paging64_gva_to_gpa;
-	context->sync_spte = paging64_sync_spte;
-}
-
-static void paging32_init_context(struct kvm_mmu *context)
-{
-	context->page_fault = paging32_page_fault;
-	context->gva_to_gpa = paging32_gva_to_gpa;
-	context->sync_spte = paging32_sync_spte;
-}
-
-static union kvm_cpu_role kvm_calc_cpu_role(struct kvm_vcpu *vcpu,
-					    const struct kvm_mmu_role_regs *regs)
-{
-	union kvm_cpu_role role = {0};
-
-	role.base.access = ACC_ALL;
-	role.base.smm = is_smm(vcpu);
-	role.base.guest_mode = is_guest_mode(vcpu);
-	role.ext.valid = 1;
-
-	if (!____is_cr0_pg(regs)) {
-		role.base.direct = 1;
-		return role;
-	}
-
-	role.base.efer_nx = ____is_efer_nx(regs);
-	role.base.cr0_wp = ____is_cr0_wp(regs);
-	role.base.smep_andnot_wp = ____is_cr4_smep(regs) && !____is_cr0_wp(regs);
-	role.base.smap_andnot_wp = ____is_cr4_smap(regs) && !____is_cr0_wp(regs);
-	role.base.has_4_byte_gpte = !____is_cr4_pae(regs);
-
-	if (____is_efer_lma(regs))
-		role.base.level = ____is_cr4_la57(regs) ? PT64_ROOT_5LEVEL
-							: PT64_ROOT_4LEVEL;
-	else if (____is_cr4_pae(regs))
-		role.base.level = PT32E_ROOT_LEVEL;
-	else
-		role.base.level = PT32_ROOT_LEVEL;
-
-	role.ext.cr4_smep = ____is_cr4_smep(regs);
-	role.ext.cr4_smap = ____is_cr4_smap(regs);
-	role.ext.cr4_pse = ____is_cr4_pse(regs);
-
-	/* PKEY and LA57 are active iff long mode is active. */
-	role.ext.cr4_pke = ____is_efer_lma(regs) && ____is_cr4_pke(regs);
-	role.ext.cr4_la57 = ____is_efer_lma(regs) && ____is_cr4_la57(regs);
-	role.ext.efer_lma = ____is_efer_lma(regs);
-	return role;
-}
-
-void __kvm_mmu_refresh_passthrough_bits(struct kvm_vcpu *vcpu,
-					struct kvm_mmu *mmu)
-{
-	const bool cr0_wp = kvm_is_cr0_bit_set(vcpu, X86_CR0_WP);
-
-	BUILD_BUG_ON((KVM_MMU_CR0_ROLE_BITS & KVM_POSSIBLE_CR0_GUEST_BITS) != X86_CR0_WP);
-	BUILD_BUG_ON((KVM_MMU_CR4_ROLE_BITS & KVM_POSSIBLE_CR4_GUEST_BITS));
-
-	if (is_cr0_wp(mmu) == cr0_wp)
-		return;
-
-	mmu->cpu_role.base.cr0_wp = cr0_wp;
-	reset_guest_paging_metadata(vcpu, mmu);
-}
-
-static inline int kvm_mmu_get_tdp_level(struct kvm_vcpu *vcpu)
-{
-	/* tdp_root_level is architecture forced level, use it if nonzero */
-	if (tdp_root_level)
-		return tdp_root_level;
-
-	/* Use 5-level TDP if and only if it's useful/necessary. */
-	if (max_tdp_level == 5 && cpuid_maxphyaddr(vcpu) <= 48)
-		return 4;
-
-	return max_tdp_level;
-}
-
-static union kvm_mmu_page_role
-kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu,
-				union kvm_cpu_role cpu_role)
-{
-	union kvm_mmu_page_role role = {0};
-
-	role.access = ACC_ALL;
-	role.cr0_wp = true;
-	role.efer_nx = true;
-	role.smm = cpu_role.base.smm;
-	role.guest_mode = cpu_role.base.guest_mode;
-	role.ad_disabled = !kvm_ad_enabled();
-	role.level = kvm_mmu_get_tdp_level(vcpu);
-	role.direct = true;
-	role.has_4_byte_gpte = false;
-
-	return role;
-}
-
-static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu,
-			     union kvm_cpu_role cpu_role)
-{
-	struct kvm_mmu *context = &vcpu->arch.root_mmu;
-	union kvm_mmu_page_role root_role = kvm_calc_tdp_mmu_root_page_role(vcpu, cpu_role);
-
-	if (cpu_role.as_u64 == context->cpu_role.as_u64 &&
-	    root_role.word == context->root_role.word)
-		return;
-
-	context->cpu_role.as_u64 = cpu_role.as_u64;
-	context->root_role.word = root_role.word;
-	context->page_fault = kvm_tdp_page_fault;
-	context->sync_spte = NULL;
-	context->get_guest_pgd = get_guest_cr3;
-	context->get_pdptr = kvm_pdptr_read;
-	context->inject_page_fault = kvm_inject_page_fault;
-
-	if (!is_cr0_pg(context))
-		context->gva_to_gpa = nonpaging_gva_to_gpa;
-	else if (is_cr4_pae(context))
-		context->gva_to_gpa = paging64_gva_to_gpa;
-	else
-		context->gva_to_gpa = paging32_gva_to_gpa;
-
-	reset_guest_paging_metadata(vcpu, context);
-	reset_tdp_shadow_zero_bits_mask(context);
-}
-
-static void shadow_mmu_init_context(struct kvm_vcpu *vcpu, struct kvm_mmu *context,
-				    union kvm_cpu_role cpu_role,
-				    union kvm_mmu_page_role root_role)
-{
-	if (cpu_role.as_u64 == context->cpu_role.as_u64 &&
-	    root_role.word == context->root_role.word)
-		return;
-
-	context->cpu_role.as_u64 = cpu_role.as_u64;
-	context->root_role.word = root_role.word;
-
-	if (!is_cr0_pg(context))
-		nonpaging_init_context(context);
-	else if (is_cr4_pae(context))
-		paging64_init_context(context);
-	else
-		paging32_init_context(context);
-
-	reset_guest_paging_metadata(vcpu, context);
-	reset_shadow_zero_bits_mask(vcpu, context);
-}
-
-static void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu,
-				union kvm_cpu_role cpu_role)
-{
-	struct kvm_mmu *context = &vcpu->arch.root_mmu;
-	union kvm_mmu_page_role root_role;
-
-	root_role = cpu_role.base;
-
-	/* KVM uses PAE paging whenever the guest isn't using 64-bit paging. */
-	root_role.level = max_t(u32, root_role.level, PT32E_ROOT_LEVEL);
-
-	/*
-	 * KVM forces EFER.NX=1 when TDP is disabled, reflect it in the MMU role.
-	 * KVM uses NX when TDP is disabled to handle a variety of scenarios,
-	 * notably for huge SPTEs if iTLB multi-hit mitigation is enabled and
-	 * to generate correct permissions for CR0.WP=0/CR4.SMEP=1/EFER.NX=0.
-	 * The iTLB multi-hit workaround can be toggled at any time, so assume
-	 * NX can be used by any non-nested shadow MMU to avoid having to reset
-	 * MMU contexts.
-	 */
-	root_role.efer_nx = true;
-
-	shadow_mmu_init_context(vcpu, context, cpu_role, root_role);
-}
-
-void kvm_init_shadow_npt_mmu(struct kvm_vcpu *vcpu, unsigned long cr0,
-			     unsigned long cr4, u64 efer, gpa_t nested_cr3)
-{
-	struct kvm_mmu *context = &vcpu->arch.guest_mmu;
-	struct kvm_mmu_role_regs regs = {
-		.cr0 = cr0,
-		.cr4 = cr4 & ~X86_CR4_PKE,
-		.efer = efer,
-	};
-	union kvm_cpu_role cpu_role = kvm_calc_cpu_role(vcpu, &regs);
-	union kvm_mmu_page_role root_role;
-
-	/* NPT requires CR0.PG=1. */
-	WARN_ON_ONCE(cpu_role.base.direct);
-
-	root_role = cpu_role.base;
-	root_role.level = kvm_mmu_get_tdp_level(vcpu);
-	if (root_role.level == PT64_ROOT_5LEVEL &&
-	    cpu_role.base.level == PT64_ROOT_4LEVEL)
-		root_role.passthrough = 1;
-
-	shadow_mmu_init_context(vcpu, context, cpu_role, root_role);
-	kvm_mmu_new_pgd(vcpu, nested_cr3);
-}
-EXPORT_SYMBOL_GPL(kvm_init_shadow_npt_mmu);
-
-static union kvm_cpu_role
-kvm_calc_shadow_ept_root_page_role(struct kvm_vcpu *vcpu, bool accessed_dirty,
-				   bool execonly, u8 level)
-{
-	union kvm_cpu_role role = {0};
-
-	/*
-	 * KVM does not support SMM transfer monitors, and consequently does not
-	 * support the "entry to SMM" control either.  role.base.smm is always 0.
-	 */
-	WARN_ON_ONCE(is_smm(vcpu));
-	role.base.level = level;
-	role.base.has_4_byte_gpte = false;
-	role.base.direct = false;
-	role.base.ad_disabled = !accessed_dirty;
-	role.base.guest_mode = true;
-	role.base.access = ACC_ALL;
-
-	role.ext.word = 0;
-	role.ext.execonly = execonly;
-	role.ext.valid = 1;
-
-	return role;
-}
-
-void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
-			     int huge_page_level, bool accessed_dirty,
-			     gpa_t new_eptp)
-{
-	struct kvm_mmu *context = &vcpu->arch.guest_mmu;
-	u8 level = vmx_eptp_page_walk_level(new_eptp);
-	union kvm_cpu_role new_mode =
-		kvm_calc_shadow_ept_root_page_role(vcpu, accessed_dirty,
-						   execonly, level);
-
-	if (new_mode.as_u64 != context->cpu_role.as_u64) {
-		/* EPT, and thus nested EPT, does not consume CR0, CR4, nor EFER. */
-		context->cpu_role.as_u64 = new_mode.as_u64;
-		context->root_role.word = new_mode.base.word;
-
-		context->page_fault = ept_page_fault;
-		context->gva_to_gpa = ept_gva_to_gpa;
-		context->sync_spte = ept_sync_spte;
-
-		update_permission_bitmask(context, true);
-		context->pkru_mask = 0;
-		reset_rsvds_bits_mask_ept(vcpu, context, execonly, huge_page_level);
-		reset_ept_shadow_zero_bits_mask(context, execonly);
-	}
-
-	kvm_mmu_new_pgd(vcpu, new_eptp);
-}
-EXPORT_SYMBOL_GPL(kvm_init_shadow_ept_mmu);
-
-static void init_kvm_softmmu(struct kvm_vcpu *vcpu,
-			     union kvm_cpu_role cpu_role)
-{
-	struct kvm_mmu *context = &vcpu->arch.root_mmu;
-
-	kvm_init_shadow_mmu(vcpu, cpu_role);
-
-	context->get_guest_pgd     = get_guest_cr3;
-	context->get_pdptr         = kvm_pdptr_read;
-	context->inject_page_fault = kvm_inject_page_fault;
-}
-
-static void init_kvm_nested_mmu(struct kvm_vcpu *vcpu,
-				union kvm_cpu_role new_mode)
-{
-	struct kvm_mmu *g_context = &vcpu->arch.nested_mmu;
-
-	if (new_mode.as_u64 == g_context->cpu_role.as_u64)
-		return;
-
-	g_context->cpu_role.as_u64   = new_mode.as_u64;
-	g_context->get_guest_pgd     = get_guest_cr3;
-	g_context->get_pdptr         = kvm_pdptr_read;
-	g_context->inject_page_fault = kvm_inject_page_fault;
-
-	/*
-	 * L2 page tables are never shadowed, so there is no need to sync
-	 * SPTEs.
-	 */
-	g_context->sync_spte         = NULL;
-
-	/*
-	 * Note that arch.mmu->gva_to_gpa translates l2_gpa to l1_gpa using
-	 * L1's nested page tables (e.g. EPT12). The nested translation
-	 * of l2_gva to l1_gpa is done by arch.nested_mmu.gva_to_gpa using
-	 * L2's page tables as the first level of translation and L1's
-	 * nested page tables as the second level of translation. Basically
-	 * the gva_to_gpa functions between mmu and nested_mmu are swapped.
-	 */
-	if (!is_paging(vcpu))
-		g_context->gva_to_gpa = nonpaging_gva_to_gpa;
-	else if (is_long_mode(vcpu))
-		g_context->gva_to_gpa = paging64_gva_to_gpa;
-	else if (is_pae(vcpu))
-		g_context->gva_to_gpa = paging64_gva_to_gpa;
-	else
-		g_context->gva_to_gpa = paging32_gva_to_gpa;
-
-	reset_guest_paging_metadata(vcpu, g_context);
-}
-
-void kvm_init_mmu(struct kvm_vcpu *vcpu)
-{
-	struct kvm_mmu_role_regs regs = vcpu_to_role_regs(vcpu);
-	union kvm_cpu_role cpu_role = kvm_calc_cpu_role(vcpu, &regs);
-
-	if (mmu_is_nested(vcpu))
-		init_kvm_nested_mmu(vcpu, cpu_role);
-	else if (tdp_enabled)
-		init_kvm_tdp_mmu(vcpu, cpu_role);
-	else
-		init_kvm_softmmu(vcpu, cpu_role);
-}
-EXPORT_SYMBOL_GPL(kvm_init_mmu);
-
-void kvm_mmu_after_set_cpuid(struct kvm_vcpu *vcpu)
-{
-	/*
-	 * Invalidate all MMU roles to force them to reinitialize as CPUID
-	 * information is factored into reserved bit calculations.
-	 *
-	 * Correctly handling multiple vCPU models with respect to paging and
-	 * physical address properties) in a single VM would require tracking
-	 * all relevant CPUID information in kvm_mmu_page_role. That is very
-	 * undesirable as it would increase the memory requirements for
-	 * gfn_track (see struct kvm_mmu_page_role comments).  For now that
-	 * problem is swept under the rug; KVM's CPUID API is horrific and
-	 * it's all but impossible to solve it without introducing a new API.
-	 */
-	vcpu->arch.root_mmu.root_role.word = 0;
-	vcpu->arch.guest_mmu.root_role.word = 0;
-	vcpu->arch.nested_mmu.root_role.word = 0;
-	vcpu->arch.root_mmu.cpu_role.ext.valid = 0;
-	vcpu->arch.guest_mmu.cpu_role.ext.valid = 0;
-	vcpu->arch.nested_mmu.cpu_role.ext.valid = 0;
-	kvm_mmu_reset_context(vcpu);
-
-	/*
-	 * Changing guest CPUID after KVM_RUN is forbidden, see the comment in
-	 * kvm_arch_vcpu_ioctl().
-	 */
-	KVM_BUG_ON(kvm_vcpu_has_run(vcpu), vcpu->kvm);
-}
-
-void kvm_mmu_reset_context(struct kvm_vcpu *vcpu)
-{
-	kvm_mmu_unload(vcpu);
-	kvm_init_mmu(vcpu);
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_reset_context);
-
-int kvm_mmu_load(struct kvm_vcpu *vcpu)
-{
-	int r;
-
-	r = mmu_topup_memory_caches(vcpu, !vcpu->arch.mmu->root_role.direct);
-	if (r)
-		goto out;
-	r = mmu_alloc_special_roots(vcpu);
-	if (r)
-		goto out;
-	if (vcpu->arch.mmu->root_role.direct)
-		r = mmu_alloc_direct_roots(vcpu);
-	else
-		r = mmu_alloc_shadow_roots(vcpu);
-	if (r)
-		goto out;
-
-	kvm_mmu_sync_roots(vcpu);
-
-	kvm_mmu_load_pgd(vcpu);
-
-	/*
-	 * Flush any TLB entries for the new root, the provenance of the root
-	 * is unknown.  Even if KVM ensures there are no stale TLB entries
-	 * for a freed root, in theory another hypervisor could have left
-	 * stale entries.  Flushing on alloc also allows KVM to skip the TLB
-	 * flush when freeing a root (see kvm_tdp_mmu_put_root()).
-	 */
-	static_call(kvm_x86_flush_tlb_current)(vcpu);
-out:
-	return r;
-}
-
-void kvm_mmu_unload(struct kvm_vcpu *vcpu)
-{
-	struct kvm *kvm = vcpu->kvm;
-
-	kvm_mmu_free_roots(kvm, &vcpu->arch.root_mmu, KVM_MMU_ROOTS_ALL);
-	WARN_ON(VALID_PAGE(vcpu->arch.root_mmu.root.hpa));
-	kvm_mmu_free_roots(kvm, &vcpu->arch.guest_mmu, KVM_MMU_ROOTS_ALL);
-	WARN_ON(VALID_PAGE(vcpu->arch.guest_mmu.root.hpa));
-	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
-}
-
-static bool is_obsolete_root(struct kvm *kvm, hpa_t root_hpa)
-{
-	struct kvm_mmu_page *sp;
-
-	if (!VALID_PAGE(root_hpa))
-		return false;
-
-	/*
-	 * When freeing obsolete roots, treat roots as obsolete if they don't
-	 * have an associated shadow page.  This does mean KVM will get false
-	 * positives and free roots that don't strictly need to be freed, but
-	 * such false positives are relatively rare:
-	 *
-	 *  (a) only PAE paging and nested NPT has roots without shadow pages
-	 *  (b) remote reloads due to a memslot update obsoletes _all_ roots
-	 *  (c) KVM doesn't track previous roots for PAE paging, and the guest
-	 *      is unlikely to zap an in-use PGD.
-	 */
-	sp = to_shadow_page(root_hpa);
-	return !sp || is_obsolete_sp(kvm, sp);
-}
-
-static void __kvm_mmu_free_obsolete_roots(struct kvm *kvm, struct kvm_mmu *mmu)
-{
-	unsigned long roots_to_free = 0;
-	int i;
-
-	if (is_obsolete_root(kvm, mmu->root.hpa))
-		roots_to_free |= KVM_MMU_ROOT_CURRENT;
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
-		if (is_obsolete_root(kvm, mmu->prev_roots[i].hpa))
-			roots_to_free |= KVM_MMU_ROOT_PREVIOUS(i);
-	}
-
-	if (roots_to_free)
-		kvm_mmu_free_roots(kvm, mmu, roots_to_free);
-}
-
-void kvm_mmu_free_obsolete_roots(struct kvm_vcpu *vcpu)
-{
-	__kvm_mmu_free_obsolete_roots(vcpu->kvm, &vcpu->arch.root_mmu);
-	__kvm_mmu_free_obsolete_roots(vcpu->kvm, &vcpu->arch.guest_mmu);
-}
-
-static u64 mmu_pte_write_fetch_gpte(struct kvm_vcpu *vcpu, gpa_t *gpa,
-				    int *bytes)
-{
-	u64 gentry = 0;
-	int r;
-
-	/*
-	 * Assume that the pte write on a page table of the same type
-	 * as the current vcpu paging mode since we update the sptes only
-	 * when they have the same mode.
-	 */
-	if (is_pae(vcpu) && *bytes == 4) {
-		/* Handle a 32-bit guest writing two halves of a 64-bit gpte */
-		*gpa &= ~(gpa_t)7;
-		*bytes = 8;
-	}
-
-	if (*bytes == 4 || *bytes == 8) {
-		r = kvm_vcpu_read_guest_atomic(vcpu, *gpa, &gentry, *bytes);
-		if (r)
-			gentry = 0;
-	}
-
-	return gentry;
-}
-
-/*
- * If we're seeing too many writes to a page, it may no longer be a page table,
- * or we may be forking, in which case it is better to unmap the page.
- */
-static bool detect_write_flooding(struct kvm_mmu_page *sp)
-{
-	/*
-	 * Skip write-flooding detected for the sp whose level is 1, because
-	 * it can become unsync, then the guest page is not write-protected.
-	 */
-	if (sp->role.level == PG_LEVEL_4K)
-		return false;
-
-	atomic_inc(&sp->write_flooding_count);
-	return atomic_read(&sp->write_flooding_count) >= 3;
-}
-
-/*
- * Misaligned accesses are too much trouble to fix up; also, they usually
- * indicate a page is not used as a page table.
- */
-static bool detect_write_misaligned(struct kvm_mmu_page *sp, gpa_t gpa,
-				    int bytes)
-{
-	unsigned offset, pte_size, misaligned;
-
-	pgprintk("misaligned: gpa %llx bytes %d role %x\n",
-		 gpa, bytes, sp->role.word);
-
-	offset = offset_in_page(gpa);
-	pte_size = sp->role.has_4_byte_gpte ? 4 : 8;
-
-	/*
-	 * Sometimes, the OS only writes the last one bytes to update status
-	 * bits, for example, in linux, andb instruction is used in clear_bit().
-	 */
-	if (!(offset & (pte_size - 1)) && bytes == 1)
-		return false;
-
-	misaligned = (offset ^ (offset + bytes - 1)) & ~(pte_size - 1);
-	misaligned |= bytes < 4;
-
-	return misaligned;
-}
-
-static u64 *get_written_sptes(struct kvm_mmu_page *sp, gpa_t gpa, int *nspte)
-{
-	unsigned page_offset, quadrant;
-	u64 *spte;
-	int level;
-
-	page_offset = offset_in_page(gpa);
-	level = sp->role.level;
-	*nspte = 1;
-	if (sp->role.has_4_byte_gpte) {
-		page_offset <<= 1;	/* 32->64 */
-		/*
-		 * A 32-bit pde maps 4MB while the shadow pdes map
-		 * only 2MB.  So we need to double the offset again
-		 * and zap two pdes instead of one.
-		 */
-		if (level == PT32_ROOT_LEVEL) {
-			page_offset &= ~7; /* kill rounding error */
-			page_offset <<= 1;
-			*nspte = 2;
-		}
-		quadrant = page_offset >> PAGE_SHIFT;
-		page_offset &= ~PAGE_MASK;
-		if (quadrant != sp->role.quadrant)
-			return NULL;
-	}
-
-	spte = &sp->spt[page_offset / sizeof(*spte)];
-	return spte;
-}
-
-static void kvm_mmu_pte_write(struct kvm_vcpu *vcpu, gpa_t gpa,
-			      const u8 *new, int bytes,
-			      struct kvm_page_track_notifier_node *node)
-{
-	gfn_t gfn = gpa >> PAGE_SHIFT;
-	struct kvm_mmu_page *sp;
-	LIST_HEAD(invalid_list);
-	u64 entry, gentry, *spte;
-	int npte;
-	bool flush = false;
-
-	/*
-	 * If we don't have indirect shadow pages, it means no page is
-	 * write-protected, so we can exit simply.
-	 */
-	if (!READ_ONCE(vcpu->kvm->arch.indirect_shadow_pages))
-		return;
-
-	pgprintk("%s: gpa %llx bytes %d\n", __func__, gpa, bytes);
-
-	write_lock(&vcpu->kvm->mmu_lock);
-
-	gentry = mmu_pte_write_fetch_gpte(vcpu, &gpa, &bytes);
-
-	++vcpu->kvm->stat.mmu_pte_write;
-
-	for_each_gfn_valid_sp_with_gptes(vcpu->kvm, sp, gfn) {
-		if (detect_write_misaligned(sp, gpa, bytes) ||
-		      detect_write_flooding(sp)) {
-			kvm_mmu_prepare_zap_page(vcpu->kvm, sp, &invalid_list);
-			++vcpu->kvm->stat.mmu_flooded;
-			continue;
-		}
-
-		spte = get_written_sptes(sp, gpa, &npte);
-		if (!spte)
-			continue;
-
-		while (npte--) {
-			entry = *spte;
-			mmu_page_zap_pte(vcpu->kvm, sp, spte, NULL);
-			if (gentry && sp->role.level != PG_LEVEL_4K)
-				++vcpu->kvm->stat.mmu_pde_zapped;
-			if (is_shadow_present_pte(entry))
-				flush = true;
-			++spte;
-		}
-	}
-	kvm_mmu_remote_flush_or_zap(vcpu->kvm, &invalid_list, flush);
-	write_unlock(&vcpu->kvm->mmu_lock);
-}
-
-int noinline kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 error_code,
-		       void *insn, int insn_len)
-{
-	int r, emulation_type = EMULTYPE_PF;
-	bool direct = vcpu->arch.mmu->root_role.direct;
-
-	if (WARN_ON(!VALID_PAGE(vcpu->arch.mmu->root.hpa)))
-		return RET_PF_RETRY;
-
-	r = RET_PF_INVALID;
-	if (unlikely(error_code & PFERR_RSVD_MASK)) {
-		r = handle_mmio_page_fault(vcpu, cr2_or_gpa, direct);
-		if (r == RET_PF_EMULATE)
-			goto emulate;
-	}
-
-	if (r == RET_PF_INVALID) {
-		r = kvm_mmu_do_page_fault(vcpu, cr2_or_gpa,
-					  lower_32_bits(error_code), false,
-					  &emulation_type);
-		if (KVM_BUG_ON(r == RET_PF_INVALID, vcpu->kvm))
-			return -EIO;
-	}
-
-	if (r < 0)
-		return r;
-	if (r != RET_PF_EMULATE)
-		return 1;
-
-	/*
-	 * Before emulating the instruction, check if the error code
-	 * was due to a RO violation while translating the guest page.
-	 * This can occur when using nested virtualization with nested
-	 * paging in both guests. If true, we simply unprotect the page
-	 * and resume the guest.
-	 */
-	if (vcpu->arch.mmu->root_role.direct &&
-	    (error_code & PFERR_NESTED_GUEST_PAGE) == PFERR_NESTED_GUEST_PAGE) {
-		kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(cr2_or_gpa));
-		return 1;
-	}
-
-	/*
-	 * vcpu->arch.mmu.page_fault returned RET_PF_EMULATE, but we can still
-	 * optimistically try to just unprotect the page and let the processor
-	 * re-execute the instruction that caused the page fault.  Do not allow
-	 * retrying MMIO emulation, as it's not only pointless but could also
-	 * cause us to enter an infinite loop because the processor will keep
-	 * faulting on the non-existent MMIO address.  Retrying an instruction
-	 * from a nested guest is also pointless and dangerous as we are only
-	 * explicitly shadowing L1's page tables, i.e. unprotecting something
-	 * for L1 isn't going to magically fix whatever issue cause L2 to fail.
-	 */
-	if (!mmio_info_in_cache(vcpu, cr2_or_gpa, direct) && !is_guest_mode(vcpu))
-		emulation_type |= EMULTYPE_ALLOW_RETRY_PF;
-emulate:
-	return x86_emulate_instruction(vcpu, cr2_or_gpa, emulation_type, insn,
-				       insn_len);
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_page_fault);
-
-static void __kvm_mmu_invalidate_addr(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
-				      u64 addr, hpa_t root_hpa)
-{
-	struct kvm_shadow_walk_iterator iterator;
-
-	vcpu_clear_mmio_info(vcpu, addr);
-
-	if (!VALID_PAGE(root_hpa))
-		return;
-
-	write_lock(&vcpu->kvm->mmu_lock);
-	for_each_shadow_entry_using_root(vcpu, root_hpa, addr, iterator) {
-		struct kvm_mmu_page *sp = sptep_to_sp(iterator.sptep);
-
-		if (sp->unsync) {
-			int ret = kvm_sync_spte(vcpu, sp, iterator.index);
-
-			if (ret < 0)
-				mmu_page_zap_pte(vcpu->kvm, sp, iterator.sptep, NULL);
-			if (ret)
-				kvm_flush_remote_tlbs_sptep(vcpu->kvm, iterator.sptep);
-		}
-
-		if (!sp->unsync_children)
-			break;
-	}
-	write_unlock(&vcpu->kvm->mmu_lock);
-}
-
-void kvm_mmu_invalidate_addr(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
-			     u64 addr, unsigned long roots)
-{
-	int i;
-
-	WARN_ON_ONCE(roots & ~KVM_MMU_ROOTS_ALL);
-
-	/* It's actually a GPA for vcpu->arch.guest_mmu.  */
-	if (mmu != &vcpu->arch.guest_mmu) {
-		/* INVLPG on a non-canonical address is a NOP according to the SDM.  */
-		if (is_noncanonical_address(addr, vcpu))
-			return;
-
-		static_call(kvm_x86_flush_tlb_gva)(vcpu, addr);
-	}
-
-	if (!mmu->sync_spte)
-		return;
-
-	if (roots & KVM_MMU_ROOT_CURRENT)
-		__kvm_mmu_invalidate_addr(vcpu, mmu, addr, mmu->root.hpa);
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
-		if (roots & KVM_MMU_ROOT_PREVIOUS(i))
-			__kvm_mmu_invalidate_addr(vcpu, mmu, addr, mmu->prev_roots[i].hpa);
-	}
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_invalidate_addr);
-
-void kvm_mmu_invlpg(struct kvm_vcpu *vcpu, gva_t gva)
-{
-	/*
-	 * INVLPG is required to invalidate any global mappings for the VA,
-	 * irrespective of PCID.  Blindly sync all roots as it would take
-	 * roughly the same amount of work/time to determine whether any of the
-	 * previous roots have a global mapping.
-	 *
-	 * Mappings not reachable via the current or previous cached roots will
-	 * be synced when switching to that new cr3, so nothing needs to be
-	 * done here for them.
-	 */
-	kvm_mmu_invalidate_addr(vcpu, vcpu->arch.walk_mmu, gva, KVM_MMU_ROOTS_ALL);
-	++vcpu->stat.invlpg;
-}
-EXPORT_SYMBOL_GPL(kvm_mmu_invlpg);
-
-
-void kvm_mmu_invpcid_gva(struct kvm_vcpu *vcpu, gva_t gva, unsigned long pcid)
-{
-	struct kvm_mmu *mmu = vcpu->arch.mmu;
-	unsigned long roots = 0;
-	uint i;
-
-	if (pcid == kvm_get_active_pcid(vcpu))
-		roots |= KVM_MMU_ROOT_CURRENT;
-
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
-		if (VALID_PAGE(mmu->prev_roots[i].hpa) &&
-		    pcid == kvm_get_pcid(vcpu, mmu->prev_roots[i].pgd))
-			roots |= KVM_MMU_ROOT_PREVIOUS(i);
-	}
-
-	if (roots)
-		kvm_mmu_invalidate_addr(vcpu, mmu, gva, roots);
-	++vcpu->stat.invlpg;
-
-	/*
-	 * Mappings not reachable via the current cr3 or the prev_roots will be
-	 * synced when switching to that cr3, so nothing needs to be done here
-	 * for them.
-	 */
-}
-
-void kvm_configure_mmu(bool enable_tdp, int tdp_forced_root_level,
-		       int tdp_max_root_level, int tdp_huge_page_level)
-{
-	tdp_enabled = enable_tdp;
-	tdp_root_level = tdp_forced_root_level;
-	max_tdp_level = tdp_max_root_level;
-
-#ifdef CONFIG_X86_64
-	tdp_mmu_enabled = tdp_mmu_allowed && tdp_enabled;
-#endif
-	/*
-	 * max_huge_page_level reflects KVM's MMU capabilities irrespective
-	 * of kernel support, e.g. KVM may be capable of using 1GB pages when
-	 * the kernel is not.  But, KVM never creates a page size greater than
-	 * what is used by the kernel for any given HVA, i.e. the kernel's
-	 * capabilities are ultimately consulted by kvm_mmu_hugepage_adjust().
-	 */
-	if (tdp_enabled)
-		max_huge_page_level = tdp_huge_page_level;
-	else if (boot_cpu_has(X86_FEATURE_GBPAGES))
-		max_huge_page_level = PG_LEVEL_1G;
-	else
-		max_huge_page_level = PG_LEVEL_2M;
-}
-EXPORT_SYMBOL_GPL(kvm_configure_mmu);
-
-/* The return value indicates if tlb flush on all vcpus is needed. */
-typedef bool (*slot_rmaps_handler) (struct kvm *kvm,
-				    struct kvm_rmap_head *rmap_head,
-				    const struct kvm_memory_slot *slot);
-
-static __always_inline bool __walk_slot_rmaps(struct kvm *kvm,
-					      const struct kvm_memory_slot *slot,
-					      slot_rmaps_handler fn,
-					      int start_level, int end_level,
-					      gfn_t start_gfn, gfn_t end_gfn,
-					      bool flush_on_yield, bool flush)
-{
-	struct slot_rmap_walk_iterator iterator;
-
-	lockdep_assert_held_write(&kvm->mmu_lock);
-
-	for_each_slot_rmap_range(slot, start_level, end_level, start_gfn,
-			end_gfn, &iterator) {
-		if (iterator.rmap)
-			flush |= fn(kvm, iterator.rmap, slot);
-
-		if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
-			if (flush && flush_on_yield) {
-				kvm_flush_remote_tlbs_range(kvm, start_gfn,
-							    iterator.gfn - start_gfn + 1);
-				flush = false;
-			}
-			cond_resched_rwlock_write(&kvm->mmu_lock);
-		}
-	}
-
-	return flush;
-}
-
-static __always_inline bool walk_slot_rmaps(struct kvm *kvm,
-					    const struct kvm_memory_slot *slot,
-					    slot_rmaps_handler fn,
-					    int start_level, int end_level,
-					    bool flush_on_yield)
-{
-	return __walk_slot_rmaps(kvm, slot, fn, start_level, end_level,
-				 slot->base_gfn, slot->base_gfn + slot->npages - 1,
-				 flush_on_yield, false);
-}
-
-static __always_inline bool walk_slot_rmaps_4k(struct kvm *kvm,
-					       const struct kvm_memory_slot *slot,
-					       slot_rmaps_handler fn,
-					       bool flush_on_yield)
-{
-	return walk_slot_rmaps(kvm, slot, fn, PG_LEVEL_4K, PG_LEVEL_4K, flush_on_yield);
-}
-
-static void free_mmu_pages(struct kvm_mmu *mmu)
-{
-	if (!tdp_enabled && mmu->pae_root)
-		set_memory_encrypted((unsigned long)mmu->pae_root, 1);
-	free_page((unsigned long)mmu->pae_root);
-	free_page((unsigned long)mmu->pml4_root);
-	free_page((unsigned long)mmu->pml5_root);
-}
-
-static int __kvm_mmu_create(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu)
-{
-	struct page *page;
-	int i;
-
-	mmu->root.hpa = INVALID_PAGE;
-	mmu->root.pgd = 0;
-	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
-		mmu->prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
-
-	/* vcpu->arch.guest_mmu isn't used when !tdp_enabled. */
-	if (!tdp_enabled && mmu == &vcpu->arch.guest_mmu)
-		return 0;
-
-	/*
-	 * When using PAE paging, the four PDPTEs are treated as 'root' pages,
-	 * while the PDP table is a per-vCPU construct that's allocated at MMU
-	 * creation.  When emulating 32-bit mode, cr3 is only 32 bits even on
-	 * x86_64.  Therefore we need to allocate the PDP table in the first
-	 * 4GB of memory, which happens to fit the DMA32 zone.  TDP paging
-	 * generally doesn't use PAE paging and can skip allocating the PDP
-	 * table.  The main exception, handled here, is SVM's 32-bit NPT.  The
-	 * other exception is for shadowing L1's 32-bit or PAE NPT on 64-bit
-	 * KVM; that horror is handled on-demand by mmu_alloc_special_roots().
-	 */
-	if (tdp_enabled && kvm_mmu_get_tdp_level(vcpu) > PT32E_ROOT_LEVEL)
-		return 0;
-
-	page = alloc_page(GFP_KERNEL_ACCOUNT | __GFP_DMA32);
-	if (!page)
-		return -ENOMEM;
-
-	mmu->pae_root = page_address(page);
-
-	/*
-	 * CR3 is only 32 bits when PAE paging is used, thus it's impossible to
-	 * get the CPU to treat the PDPTEs as encrypted.  Decrypt the page so
-	 * that KVM's writes and the CPU's reads get along.  Note, this is
-	 * only necessary when using shadow paging, as 64-bit NPT can get at
-	 * the C-bit even when shadowing 32-bit NPT, and SME isn't supported
-	 * by 32-bit kernels (when KVM itself uses 32-bit NPT).
-	 */
-	if (!tdp_enabled)
-		set_memory_decrypted((unsigned long)mmu->pae_root, 1);
-	else
-		WARN_ON_ONCE(shadow_me_value);
-
-	for (i = 0; i < 4; ++i)
-		mmu->pae_root[i] = INVALID_PAE_ROOT;
-
-	return 0;
-}
-
-int kvm_mmu_create(struct kvm_vcpu *vcpu)
-{
-	int ret;
-
-	vcpu->arch.mmu_pte_list_desc_cache.kmem_cache = pte_list_desc_cache;
-	vcpu->arch.mmu_pte_list_desc_cache.gfp_zero = __GFP_ZERO;
-
-	vcpu->arch.mmu_page_header_cache.kmem_cache = mmu_page_header_cache;
-	vcpu->arch.mmu_page_header_cache.gfp_zero = __GFP_ZERO;
-
-	vcpu->arch.mmu_shadow_page_cache.gfp_zero = __GFP_ZERO;
-
-	vcpu->arch.mmu = &vcpu->arch.root_mmu;
-	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
-
-	ret = __kvm_mmu_create(vcpu, &vcpu->arch.guest_mmu);
-	if (ret)
-		return ret;
-
-	ret = __kvm_mmu_create(vcpu, &vcpu->arch.root_mmu);
-	if (ret)
-		goto fail_allocate_root;
-
-	return ret;
- fail_allocate_root:
-	free_mmu_pages(&vcpu->arch.guest_mmu);
-	return ret;
-}
-
-#define BATCH_ZAP_PAGES	10
-static void kvm_zap_obsolete_pages(struct kvm *kvm)
-{
-	struct kvm_mmu_page *sp, *node;
-	int nr_zapped, batch = 0;
-	bool unstable;
-
-restart:
-	list_for_each_entry_safe_reverse(sp, node,
-	      &kvm->arch.active_mmu_pages, link) {
-		/*
-		 * No obsolete valid page exists before a newly created page
-		 * since active_mmu_pages is a FIFO list.
-		 */
-		if (!is_obsolete_sp(kvm, sp))
-			break;
-
-		/*
-		 * Invalid pages should never land back on the list of active
-		 * pages.  Skip the bogus page, otherwise we'll get stuck in an
-		 * infinite loop if the page gets put back on the list (again).
-		 */
-		if (WARN_ON(sp->role.invalid))
-			continue;
-
-		/*
-		 * No need to flush the TLB since we're only zapping shadow
-		 * pages with an obsolete generation number and all vCPUS have
-		 * loaded a new root, i.e. the shadow pages being zapped cannot
-		 * be in active use by the guest.
-		 */
-		if (batch >= BATCH_ZAP_PAGES &&
-		    cond_resched_rwlock_write(&kvm->mmu_lock)) {
-			batch = 0;
-			goto restart;
-		}
-
-		unstable = __kvm_mmu_prepare_zap_page(kvm, sp,
-				&kvm->arch.zapped_obsolete_pages, &nr_zapped);
-		batch += nr_zapped;
-
-		if (unstable)
-			goto restart;
-	}
-
-	/*
-	 * Kick all vCPUs (via remote TLB flush) before freeing the page tables
-	 * to ensure KVM is not in the middle of a lockless shadow page table
-	 * walk, which may reference the pages.  The remote TLB flush itself is
-	 * not required and is simply a convenient way to kick vCPUs as needed.
-	 * KVM performs a local TLB flush when allocating a new root (see
-	 * kvm_mmu_load()), and the reload in the caller ensure no vCPUs are
-	 * running with an obsolete MMU.
-	 */
-	kvm_mmu_commit_zap_page(kvm, &kvm->arch.zapped_obsolete_pages);
-}
-
-/*
- * Fast invalidate all shadow pages and use lock-break technique
- * to zap obsolete pages.
- *
- * It's required when memslot is being deleted or VM is being
- * destroyed, in these cases, we should ensure that KVM MMU does
- * not use any resource of the being-deleted slot or all slots
- * after calling the function.
- */
-static void kvm_mmu_zap_all_fast(struct kvm *kvm)
-{
-	lockdep_assert_held(&kvm->slots_lock);
-
-	write_lock(&kvm->mmu_lock);
-	trace_kvm_mmu_zap_all_fast(kvm);
-
-	/*
-	 * Toggle mmu_valid_gen between '0' and '1'.  Because slots_lock is
-	 * held for the entire duration of zapping obsolete pages, it's
-	 * impossible for there to be multiple invalid generations associated
-	 * with *valid* shadow pages at any given time, i.e. there is exactly
-	 * one valid generation and (at most) one invalid generation.
-	 */
-	kvm->arch.mmu_valid_gen = kvm->arch.mmu_valid_gen ? 0 : 1;
-
-	/*
-	 * In order to ensure all vCPUs drop their soon-to-be invalid roots,
-	 * invalidating TDP MMU roots must be done while holding mmu_lock for
-	 * write and in the same critical section as making the reload request,
-	 * e.g. before kvm_zap_obsolete_pages() could drop mmu_lock and yield.
-	 */
-	if (tdp_mmu_enabled)
-		kvm_tdp_mmu_invalidate_all_roots(kvm);
-
-	/*
-	 * Notify all vcpus to reload its shadow page table and flush TLB.
-	 * Then all vcpus will switch to new shadow page table with the new
-	 * mmu_valid_gen.
-	 *
-	 * Note: we need to do this under the protection of mmu_lock,
-	 * otherwise, vcpu would purge shadow page but miss tlb flush.
-	 */
-	kvm_make_all_cpus_request(kvm, KVM_REQ_MMU_FREE_OBSOLETE_ROOTS);
-
-	kvm_zap_obsolete_pages(kvm);
-
-	write_unlock(&kvm->mmu_lock);
-
-	/*
-	 * Zap the invalidated TDP MMU roots, all SPTEs must be dropped before
-	 * returning to the caller, e.g. if the zap is in response to a memslot
-	 * deletion, mmu_notifier callbacks will be unable to reach the SPTEs
-	 * associated with the deleted memslot once the update completes, and
-	 * Deferring the zap until the final reference to the root is put would
-	 * lead to use-after-free.
-	 */
-	if (tdp_mmu_enabled)
-		kvm_tdp_mmu_zap_invalidated_roots(kvm);
-}
-
-static bool kvm_has_zapped_obsolete_pages(struct kvm *kvm)
-{
-	return unlikely(!list_empty_careful(&kvm->arch.zapped_obsolete_pages));
-}
-
-static void kvm_mmu_invalidate_zap_pages_in_memslot(struct kvm *kvm,
-			struct kvm_memory_slot *slot,
-			struct kvm_page_track_notifier_node *node)
-{
-	kvm_mmu_zap_all_fast(kvm);
-}
-
-int kvm_mmu_init_vm(struct kvm *kvm)
-{
-	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
-	int r;
-
-	INIT_LIST_HEAD(&kvm->arch.active_mmu_pages);
-	INIT_LIST_HEAD(&kvm->arch.zapped_obsolete_pages);
-	INIT_LIST_HEAD(&kvm->arch.possible_nx_huge_pages);
-	spin_lock_init(&kvm->arch.mmu_unsync_pages_lock);
-
-	if (tdp_mmu_enabled) {
-		r = kvm_mmu_init_tdp_mmu(kvm);
-		if (r < 0)
-			return r;
-	}
-
-	node->track_write = kvm_mmu_pte_write;
-	node->track_flush_slot = kvm_mmu_invalidate_zap_pages_in_memslot;
-	kvm_page_track_register_notifier(kvm, node);
-
-	kvm->arch.split_page_header_cache.kmem_cache = mmu_page_header_cache;
-	kvm->arch.split_page_header_cache.gfp_zero = __GFP_ZERO;
-
-	kvm->arch.split_shadow_page_cache.gfp_zero = __GFP_ZERO;
-
-	kvm->arch.split_desc_cache.kmem_cache = pte_list_desc_cache;
-	kvm->arch.split_desc_cache.gfp_zero = __GFP_ZERO;
-
-	return 0;
-}
-
-static void mmu_free_vm_memory_caches(struct kvm *kvm)
-{
-	kvm_mmu_free_memory_cache(&kvm->arch.split_desc_cache);
-	kvm_mmu_free_memory_cache(&kvm->arch.split_page_header_cache);
-	kvm_mmu_free_memory_cache(&kvm->arch.split_shadow_page_cache);
-}
-
-void kvm_mmu_uninit_vm(struct kvm *kvm)
-{
-	struct kvm_page_track_notifier_node *node = &kvm->arch.mmu_sp_tracker;
-
-	kvm_page_track_unregister_notifier(kvm, node);
-
-	if (tdp_mmu_enabled)
-		kvm_mmu_uninit_tdp_mmu(kvm);
-
-	mmu_free_vm_memory_caches(kvm);
-}
-
-static bool kvm_rmap_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
-{
-	const struct kvm_memory_slot *memslot;
-	struct kvm_memslots *slots;
-	struct kvm_memslot_iter iter;
-	bool flush = false;
-	gfn_t start, end;
-	int i;
-
-	if (!kvm_memslots_have_rmaps(kvm))
-		return flush;
-
-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
-		slots = __kvm_memslots(kvm, i);
-
-		kvm_for_each_memslot_in_gfn_range(&iter, slots, gfn_start, gfn_end) {
-			memslot = iter.slot;
-			start = max(gfn_start, memslot->base_gfn);
-			end = min(gfn_end, memslot->base_gfn + memslot->npages);
-			if (WARN_ON_ONCE(start >= end))
-				continue;
-
-			flush = __walk_slot_rmaps(kvm, memslot, __kvm_zap_rmap,
-						  PG_LEVEL_4K, KVM_MAX_HUGEPAGE_LEVEL,
-						  start, end - 1, true, flush);
-		}
-	}
-
-	return flush;
-}
-
-/*
- * Invalidate (zap) SPTEs that cover GFNs from gfn_start and up to gfn_end
- * (not including it)
- */
-void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
-{
-	bool flush;
-	int i;
-
-	if (WARN_ON_ONCE(gfn_end <= gfn_start))
-		return;
-
-	write_lock(&kvm->mmu_lock);
-
-	kvm_mmu_invalidate_begin(kvm, 0, -1ul);
-
-	flush = kvm_rmap_zap_gfn_range(kvm, gfn_start, gfn_end);
-
-	if (tdp_mmu_enabled) {
-		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++)
-			flush = kvm_tdp_mmu_zap_leafs(kvm, i, gfn_start,
-						      gfn_end, true, flush);
-	}
-
-	if (flush)
-		kvm_flush_remote_tlbs_range(kvm, gfn_start, gfn_end - gfn_start);
-
-	kvm_mmu_invalidate_end(kvm, 0, -1ul);
+	if (kvm_mmu_honors_guest_mtrrs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 kvm_arch_nr_memslot_as_ids(kvm)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       range_add                                                                                                                                                                                                                                                                                           );
 
 	write_unlock(&kvm->mmu_lock);
 }
 
-static bool slot_rmap_write_protect(struct kvm *kvm,
-				    struct kvm_rmap_head *rmap_head,
-				    const struct kvm_memory_slot *slot)
-{
-	return rmap_write_protect(rmap_head, false);
-}
-
-void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
-				      const struct kvm_memory_slot *memslot,
-				      int start_level)
-{
-	if (kvm_memslots_have_rmaps(kvm)) {
-		write_lock(&kvm->mmu_lock);
-		walk_slot_rmaps(kvm, memslot, slot_rmap_write_protect,
-				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
-		write_unlock(&kvm->mmu_lock);
-	}
-
-	if (tdp_mmu_enabled) {
-		read_lock(&kvm->mmu_lock);
-		kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
-		read_unlock(&kvm->mmu_lock);
-	}
-}
-
-static inline bool need_topup(struct kvm_mmu_memory_cache *cache, int min)
-{
-	return kvm_mmu_memory_cache_nr_free_objects(cache) < min;
-}
-
-static bool need_topup_split_caches_or_resched(struct kvm *kvm)
-{
-	if (need_resched() || rwlock_needbreak(&kvm->mmu_lock))
-		return true;
-
-	/*
-	 * In the worst case, SPLIT_DESC_CACHE_MIN_NR_OBJECTS descriptors are needed
-	 * to split a single huge page. Calculating how many are actually needed
-	 * is possible but not worth the complexity.
-	 */
-	return need_topup(&kvm->arch.split_desc_cache, SPLIT_DESC_CACHE_MIN_NR_OBJECTS) ||
-	       need_topup(&kvm->arch.split_page_header_cache, 1) ||
-	       need_topup(&kvm->arch.split_shadow_page_cache, 1);
-}
-
-static int topup_split_caches(struct kvm *kvm)
-{
-	/*
-	 * Allocating rmap list entries when splitting huge pages for nested
-	 * MMUs is uncommon as KVM needs to use a list if and only if there is
-	 * more than one rmap entry for a gfn, i.e. requires an L1 gfn to be
-	 * aliased by multiple L2 gfns and/or from multiple nested roots with
-	 * different roles.  Aliasing gfns when using TDP is atypical for VMMs;
-	 * a few gfns are often aliased during boot, e.g. when remapping BIOS,
-	 * but aliasing rarely occurs post-boot or for many gfns.  If there is
-	 * only one rmap entry, rmap->val points directly at that one entry and
-	 * doesn't need to allocate a list.  Buffer the cache by the default
-	 * capacity so that KVM doesn't have to drop mmu_lock to topup if KVM
-	 * encounters an aliased gfn or two.
-	 */
-	const int capacity = SPLIT_DESC_CACHE_MIN_NR_OBJECTS +
-			     KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE;
-	int r;
-
-	lockdep_assert_held(&kvm->slots_lock);
-
-	r = __kvm_mmu_topup_memory_cache(&kvm->arch.split_desc_cache, capacity,
-					 SPLIT_DESC_CACHE_MIN_NR_OBJECTS);
-	if (r)
-		return r;
-
-	r = kvm_mmu_topup_memory_cache(&kvm->arch.split_page_header_cache, 1);
-	if (r)
-		return r;
-
-	return kvm_mmu_topup_memory_cache(&kvm->arch.split_shadow_page_cache, 1);
-}
-
-static struct kvm_mmu_page *shadow_mmu_get_sp_for_split(struct kvm *kvm, u64 *huge_sptep)
-{
-	struct kvm_mmu_page *huge_sp = sptep_to_sp(huge_sptep);
-	struct shadow_page_caches caches = {};
-	union kvm_mmu_page_role role;
-	unsigned int access;
-	gfn_t gfn;
-
-	gfn = kvm_mmu_page_get_gfn(huge_sp, spte_index(huge_sptep));
-	access = kvm_mmu_page_get_access(huge_sp, spte_index(huge_sptep));
-
-	/*
-	 * Note, huge page splitting always uses direct shadow pages, regardless
-	 * of whether the huge page itself is mapped by a direct or indirect
-	 * shadow page, since the huge page region itself is being directly
-	 * mapped with smaller pages.
-	 */
-	role = kvm_mmu_child_role(huge_sptep, /*direct=*/true, access);
-
-	/* Direct SPs do not require a shadowed_info_cache. */
-	caches.page_header_cache = &kvm->arch.split_page_header_cache;
-	caches.shadow_page_cache = &kvm->arch.split_shadow_page_cache;
-
-	/* Safe to pass NULL for vCPU since requesting a direct SP. */
-	return __kvm_mmu_get_shadow_page(kvm, NULL, &caches, gfn, role);
-}
-
-static void shadow_mmu_split_huge_page(struct kvm *kvm,
-				       const struct kvm_memory_slot *slot,
-				       u64 *huge_sptep)
-
-{
-	struct kvm_mmu_memory_cache *cache = &kvm->arch.split_desc_cache;
-	u64 huge_spte = READ_ONCE(*huge_sptep);
-	struct kvm_mmu_page *sp;
-	bool flush = false;
-	u64 *sptep, spte;
-	gfn_t gfn;
-	int index;
-
-	sp = shadow_mmu_get_sp_for_split(kvm, huge_sptep);
-
-	for (index = 0; index < SPTE_ENT_PER_PAGE; index++) {
-		sptep = &sp->spt[index];
-		gfn = kvm_mmu_page_get_gfn(sp, index);
-
-		/*
-		 * The SP may already have populated SPTEs, e.g. if this huge
-		 * page is aliased by multiple sptes with the same access
-		 * permissions. These entries are guaranteed to map the same
-		 * gfn-to-pfn translation since the SP is direct, so no need to
-		 * modify them.
-		 *
-		 * However, if a given SPTE points to a lower level page table,
-		 * that lower level page table may only be partially populated.
-		 * Installing such SPTEs would effectively unmap a potion of the
-		 * huge page. Unmapping guest memory always requires a TLB flush
-		 * since a subsequent operation on the unmapped regions would
-		 * fail to detect the need to flush.
-		 */
-		if (is_shadow_present_pte(*sptep)) {
-			flush |= !is_last_spte(*sptep, sp->role.level);
-			continue;
-		}
-
-		spte = make_huge_page_split_spte(kvm, huge_spte, sp->role, index);
-		mmu_spte_set(sptep, spte);
-		__rmap_add(kvm, cache, slot, sptep, gfn, sp->role.access);
-	}
-
-	__link_shadow_page(kvm, cache, huge_sptep, sp, flush);
-}
-
-static int shadow_mmu_try_split_huge_page(struct kvm *kvm,
-					  const struct kvm_memory_slot *slot,
-					  u64 *huge_sptep)
-{
-	struct kvm_mmu_page *huge_sp = sptep_to_sp(huge_sptep);
-	int level, r = 0;
-	gfn_t gfn;
-	u64 spte;
-
-	/* Grab information for the tracepoint before dropping the MMU lock. */
-	gfn = kvm_mmu_page_get_gfn(huge_sp, spte_index(huge_sptep));
-	level = huge_sp->role.level;
-	spte = *huge_sptep;
-
-	if (kvm_mmu_available_pages(kvm) <= KVM_MIN_FREE_MMU_PAGES) {
-		r = -ENOSPC;
-		goto out;
-	}
-
-	if (need_topup_split_caches_or_resched(kvm)) {
-		write_unlock(&kvm->mmu_lock);
-		cond_resched();
-		/*
-		 * If the topup succeeds, return -EAGAIN to indicate that the
-		 * rmap iterator should be restarted because the MMU lock was
-		 * dropped.
-		 */
-		r = topup_split_caches(kvm) ?: -EAGAIN;
-		write_lock(&kvm->mmu_lock);
-		goto out;
-	}
-
-	shadow_mmu_split_huge_page(kvm, slot, huge_sptep);
-
-out:
-	trace_kvm_mmu_split_huge_page(gfn, spte, level, r);
-	return r;
-}
-
-static bool shadow_mmu_try_split_huge_pages(struct kvm *kvm,
-					    struct kvm_rmap_head *rmap_head,
-					    const struct kvm_memory_slot *slot)
-{
-	struct rmap_iterator iter;
-	struct kvm_mmu_page *sp;
-	u64 *huge_sptep;
-	int r;
-
-restart:
-	for_each_rmap_spte(rmap_head, &iter, huge_sptep) {
-		sp = sptep_to_sp(huge_sptep);
-
-		/* TDP MMU is enabled, so rmap only contains nested MMU SPs. */
-		if (WARN_ON_ONCE(!sp->role.guest_mode))
-			continue;
-
-		/* The rmaps should never contain non-leaf SPTEs. */
-		if (WARN_ON_ONCE(!is_large_pte(*huge_sptep)))
-			continue;
-
-		/* SPs with level >PG_LEVEL_4K should never by unsync. */
-		if (WARN_ON_ONCE(sp->unsync))
-			continue;
-
-		/* Don't bother splitting huge pages on invalid SPs. */
-		if (sp->role.invalid)
-			continue;
-
-		r = shadow_mmu_try_split_huge_page(kvm, slot, huge_sptep);
-
-		/*
-		 * The split succeeded or needs to be retried because the MMU
-		 * lock was dropped. Either way, restart the iterator to get it
-		 * back into a consistent state.
-		 */
-		if (!r || r == -EAGAIN)
-			goto restart;
-
-		/* The split failed and shouldn't be retried (e.g. -ENOMEM). */
-		break;
-	}
-
-	return false;
-}
-
-static void kvm_shadow_mmu_try_split_huge_pages(struct kvm *kvm,
-						const struct kvm_memory_slot *slot,
-						gfn_t start, gfn_t end,
-						int target_level)
-{
-	int level;
-
-	/*
-	 * Split huge pages starting with KVM_MAX_HUGEPAGE_LEVEL and working
-	 * down to the target level. This ensures pages are recursively split
-	 * all the way to the target level. There's no need to split pages
-	 * already at the target level.
-	 */
-	for (level = KVM_MAX_HUGEPAGE_LEVEL; level > target_level; level--)
-		__walk_slot_rmaps(kvm, slot, shadow_mmu_try_split_huge_pages,
-				  level, level, start, end - 1, true, false);
-}
-
-/* Must be called with the mmu_lock held in write-mode. */
-void kvm_mmu_try_split_huge_pages(struct kvm *kvm,
-				   const struct kvm_memory_slot *memslot,
-				   u64 start, u64 end,
-				   int target_level)
-{
-	if (!tdp_mmu_enabled)
-		return;
-
-	if (kvm_memslots_have_rmaps(kvm))
-		kvm_shadow_mmu_try_split_huge_pages(kvm, memslot, start, end, target_level);
-
-	kvm_tdp_mmu_try_split_huge_pages(kvm, memslot, start, end, target_level, false);
-
-	/*
-	 * A TLB flush is unnecessary at this point for the same resons as in
-	 * kvm_mmu_slot_try_split_huge_pages().
-	 */
-}
-
-void kvm_mmu_slot_try_split_huge_pages(struct kvm *kvm,
-					const struct kvm_memory_slot *memslot,
-					int target_level)
-{
-	u64 start = memslot->base_gfn;
-	u64 end = start + memslot->npages;
-
-	if (!tdp_mmu_enabled)
-		return;
-
-	if (kvm_memslots_have_rmaps(kvm)) {
-		write_lock(&kvm->mmu_lock);
-		kvm_shadow_mmu_try_split_huge_pages(kvm, memslot, start, end, target_level);
-		write_unlock(&kvm->mmu_lock);
-	}
-
-	read_lock(&kvm->mmu_lock);
-	kvm_tdp_mmu_try_split_huge_pages(kvm, memslot, start, end, target_level, true);
-	read_unlock(&kvm->mmu_lock);
-
-	/*
-	 * No TLB flush is necessary here. KVM will flush TLBs after
-	 * write-protecting and/or clearing dirty on the newly split SPTEs to
-	 * ensure that guest writes are reflected in the dirty log before the
-	 * ioctl to enable dirty logging on this memslot completes. Since the
-	 * split SPTEs retain the write and dirty bits of the huge SPTE, it is
-	 * safe for KVM to decide if a TLB flush is necessary based on the split
-	 * SPTEs.
-	 */
-}
-
-static bool kvm_mmu_zap_collapsible_spte(struct kvm *kvm,
-					 struct kvm_rmap_head *rmap_head,
-					 const struct kvm_memory_slot *slot)
-{
-	u64 *sptep;
-	struct rmap_iterator iter;
-	int need_tlb_flush = 0;
-	struct kvm_mmu_page *sp;
-
-restart:
-	for_each_rmap_spte(rmap_head, &iter, sptep) {
-		sp = sptep_to_sp(sptep);
-
-		/*
-		 * We cannot do huge page mapping for indirect shadow pages,
-		 * which are found on the last rmap (level = 1) when not using
-		 * tdp; such shadow pages are synced with the page table in
-		 * the guest, and the guest page table is using 4K page size
-		 * mapping if the indirect sp has level = 1.
-		 */
-		if (sp->role.direct &&
-		    sp->role.level < kvm_mmu_max_mapping_level(kvm, slot, sp->gfn,
-							       PG_LEVEL_NUM)) {
-			kvm_zap_one_rmap_spte(kvm, rmap_head, sptep);
-
-			if (kvm_available_flush_remote_tlbs_range())
-				kvm_flush_remote_tlbs_sptep(kvm, sptep);
-			else
-				need_tlb_flush = 1;
-
-			goto restart;
-		}
-	}
-
-	return need_tlb_flush;
-}
-
-static void kvm_rmap_zap_collapsible_sptes(struct kvm *kvm,
-					   const struct kvm_memory_slot *slot)
-{
-	/*
-	 * Note, use KVM_MAX_HUGEPAGE_LEVEL - 1 since there's no need to zap
-	 * pages that are already mapped at the maximum hugepage level.
-	 */
-	if (walk_slot_rmaps(kvm, slot, kvm_mmu_zap_collapsible_spte,
-			    PG_LEVEL_4K, KVM_MAX_HUGEPAGE_LEVEL - 1, true))
-		kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
-}
-
-void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
-				   const struct kvm_memory_slot *slot)
-{
-	if (kvm_memslots_have_rmaps(kvm)) {
-		write_lock(&kvm->mmu_lock);
-		kvm_rmap_zap_collapsible_sptes(kvm, slot);
-		write_unlock(&kvm->mmu_lock);
-	}
-
-	if (tdp_mmu_enabled) {
-		read_lock(&kvm->mmu_lock);
-		kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot);
-		read_unlock(&kvm->mmu_lock);
-	}
-}
-
-void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
-					const struct kvm_memory_slot *memslot)
-{
-	/*
-	 * All current use cases for flushing the TLBs for a specific memslot
-	 * related to dirty logging, and many do the TLB flush out of mmu_lock.
-	 * The interaction between the various operations on memslot must be
-	 * serialized by slots_locks to ensure the TLB flush from one operation
-	 * is observed by any other operation on the same memslot.
-	 */
-	lockdep_assert_held(&kvm->slots_lock);
-	kvm_flush_remote_tlbs_range(kvm, memslot->base_gfn, memslot->npages);
-}
-
-void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
-				   const struct kvm_memory_slot *memslot)
-{
-	if (kvm_memslots_have_rmaps(kvm)) {
-		write_lock(&kvm->mmu_lock);
-		/*
-		 * Clear dirty bits only on 4k SPTEs since the legacy MMU only
-		 * support dirty logging at a 4k granularity.
-		 */
-		walk_slot_rmaps_4k(kvm, memslot, __rmap_clear_dirty, false);
-		write_unlock(&kvm->mmu_lock);
-	}
-
-	if (tdp_mmu_enabled) {
-		read_lock(&kvm->mmu_lock);
-		kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
-		read_unlock(&kvm->mmu_lock);
-	}
-
-	/*
-	 * The caller will flush the TLBs after this function returns.
-	 *
-	 * It's also safe to flush TLBs out of mmu lock here as currently this
-	 * function is only used for dirty logging, in which case flushing TLB
-	 * out of mmu lock also guarantees no dirty pages will be lost in
-	 * dirty_bitmap.
-	 */
-}
-
-void kvm_mmu_zap_all(struct kvm *kvm)
-{
-	struct kvm_mmu_page *sp, *node;
-	LIST_HEAD(invalid_list);
-	int ign;
-
-	write_lock(&kvm->mmu_lock);
-restart:
-	list_for_each_entry_safe(sp, node, &kvm->arch.active_mmu_pages, link) {
-		if (WARN_ON(sp->role.invalid))
-			continue;
-		if (__kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list, &ign))
-			goto restart;
-		if (cond_resched_rwlock_write(&kvm->mmu_lock))
-			goto restart;
-	}
-
-	kvm_mmu_commit_zap_page(kvm, &invalid_list);
-
-	if (tdp_mmu_enabled)
-		kvm_tdp_mmu_zap_all(kvm);
-
-	write_unlock(&kvm->mmu_lock);
-}
-
-void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen)
-{
-	WARN_ON(gen & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS);
-
-	gen &= MMIO_SPTE_GEN_MASK;
-
-	/*
-	 * Generation numbers are incremented in multiples of the number of
-	 * address spaces in order to provide unique generations across all
-	 * address spaces.  Strip what is effectively the address space
-	 * modifier prior to checking for a wrap of the MMIO generation so
-	 * that a wrap in any address space is detected.
-	 */
-	gen &= ~((u64)KVM_ADDRESS_SPACE_NUM - 1);
-
-	/*
-	 * The very rare case: if the MMIO generation number has wrapped,
-	 * zap all shadow pages.
-	 */
-	if (unlikely(gen == 0)) {
-		kvm_debug_ratelimited("zapping shadow pages for mmio generation wraparound\n");
-		kvm_mmu_zap_all_fast(kvm);
-	}
-}
-
-static unsigned long mmu_shrink_scan(struct shrinker *shrink,
-				     struct shrink_control *sc)
-{
-	struct kvm *kvm;
-	int nr_to_scan = sc->nr_to_scan;
-	unsigned long freed = 0;
-
-	mutex_lock(&kvm_lock);
-
-	list_for_each_entry(kvm, &vm_list, vm_list) {
-		int idx;
-		LIST_HEAD(invalid_list);
-
-		/*
-		 * Never scan more than sc->nr_to_scan VM instances.
-		 * Will not hit this condition practically since we do not try
-		 * to shrink more than one VM and it is very unlikely to see
-		 * !n_used_mmu_pages so many times.
-		 */
-		if (!nr_to_scan--)
-			break;
-		/*
-		 * n_used_mmu_pages is accessed without holding kvm->mmu_lock
-		 * here. We may skip a VM instance errorneosly, but we do not
-		 * want to shrink a VM that only started to populate its MMU
-		 * anyway.
-		 */
-		if (!kvm->arch.n_used_mmu_pages &&
-		    !kvm_has_zapped_obsolete_pages(kvm))
-			continue;
-
-		idx = srcu_read_lock(&kvm->srcu);
-		write_lock(&kvm->mmu_lock);
-
-		if (kvm_has_zapped_obsolete_pages(kvm)) {
-			kvm_mmu_commit_zap_page(kvm,
-			      &kvm->arch.zapped_obsolete_pages);
-			goto unlock;
-		}
-
-		freed = kvm_mmu_zap_oldest_mmu_pages(kvm, sc->nr_to_scan);
-
-unlock:
-		write_unlock(&kvm->mmu_lock);
-		srcu_read_unlock(&kvm->srcu, idx);
-
-		/*
-		 * unfair on small ones
-		 * per-vm shrinkers cry out
-		 * sadness comes quickly
-		 */
-		list_move_tail(&kvm->vm_list, &vm_list);
-		break;
-	}
-
-	mutex_unlock(&kvm_lock);
-	return freed;
-}
-
-static unsigned long mmu_shrink_count(struct shrinker *shrink,
-				      struct shrink_control *sc)
-{
-	return percpu_counter_read_positive(&kvm_total_used_mmu_pages);
-}
-
-static struct shrinker mmu_shrinker = {
-	.count_objects = mmu_shrink_count,
-	.scan_objects = mmu_shrink_scan,
-	.seeks = DEFAULT_SEEKS * 10,
-};
-
-static void mmu_destroy_caches(void)
-{
-	kmem_cache_destroy(pte_list_desc_cache);
-	kmem_cache_destroy(mmu_page_header_cache);
-}
-
-static bool get_nx_auto_mode(void)
-{
-	/* Return true when CPU has the bug, and mitigations are ON */
-	return boot_cpu_has_bug(X86_BUG_ITLB_MULTIHIT) && !cpu_mitigations_off();
-}
-
-static void __set_nx_huge_pages(bool val)
-{
-	nx_huge_pages = itlb_multihit_kvm_mitigation = val;
-}
-
-static int set_nx_huge_pages(const char *val, const struct kernel_param *kp)
-{
-	bool old_val = nx_huge_pages;
-	bool new_val;
-
-	/* In "auto" mode deploy workaround only if CPU has the bug. */
-	if (sysfs_streq(val, "off"))
-		new_val = 0;
-	else if (sysfs_streq(val, "force"))
-		new_val = 1;
-	else if (sysfs_streq(val, "auto"))
-		new_val = get_nx_auto_mode();
-	else if (kstrtobool(val, &new_val) < 0)
-		return -EINVAL;
-
-	__set_nx_huge_pages(new_val);
-
-	if (new_val != old_val) {
-		struct kvm *kvm;
-
-		mutex_lock(&kvm_lock);
-
-		list_for_each_entry(kvm, &vm_list, vm_list) {
-			mutex_lock(&kvm->slots_lock);
-			kvm_mmu_zap_all_fast(kvm);
-			mutex_unlock(&kvm->slots_lock);
-
-			wake_up_process(kvm->arch.nx_huge_page_recovery_thread);
-		}
-		mutex_unlock(&kvm_lock);
-	}
-
-	return 0;
-}
-
-/*
- * nx_huge_pages needs to be resolved to true/false when kvm.ko is loaded, as
- * its default value of -1 is technically undefined behavior for a boolean.
- * Forward the module init call to SPTE code so that it too can handle module
- * params that need to be resolved/snapshot.
- */
-void __init kvm_mmu_x86_module_init(void)
-{
-	if (nx_huge_pages == -1)
-		__set_nx_huge_pages(get_nx_auto_mode());
-
-	/*
-	 * Snapshot userspace's desire to enable the TDP MMU. Whether or not the
-	 * TDP MMU is actually enabled is determined in kvm_configure_mmu()
-	 * when the vendor module is loaded.
-	 */
-	tdp_mmu_allowed = tdp_mmu_enabled;
-
-	kvm_mmu_spte_module_init();
-}
-
-/*
- * The bulk of the MMU initialization is deferred until the vendor module is
- * loaded as many of the masks/values may be modified by VMX or SVM, i.e. need
- * to be reset when a potentially different vendor module is loaded.
- */
-int kvm_mmu_vendor_module_init(void)
-{
-	int ret = -ENOMEM;
-
-	/*
-	 * MMU roles use union aliasing which is, generally speaking, an
-	 * undefined behavior. However, we supposedly know how compilers behave
-	 * and the current status quo is unlikely to change. Guardians below are
-	 * supposed to let us know if the assumption becomes false.
-	 */
-	BUILD_BUG_ON(sizeof(union kvm_mmu_page_role) != sizeof(u32));
-	BUILD_BUG_ON(sizeof(union kvm_mmu_extended_role) != sizeof(u32));
-	BUILD_BUG_ON(sizeof(union kvm_cpu_role) != sizeof(u64));
-
-	kvm_mmu_reset_all_pte_masks();
-
-	pte_list_desc_cache = kmem_cache_create("pte_list_desc",
-					    sizeof(struct pte_list_desc),
-					    0, SLAB_ACCOUNT, NULL);
-	if (!pte_list_desc_cache)
-		goto out;
-
-	mmu_page_header_cache = kmem_cache_create("kvm_mmu_page_header",
-						  sizeof(struct kvm_mmu_page),
-						  0, SLAB_ACCOUNT, NULL);
-	if (!mmu_page_header_cache)
-		goto out;
-
-	if (percpu_counter_init(&kvm_total_used_mmu_pages, 0, GFP_KERNEL))
-		goto out;
-
-	ret = register_shrinker(&mmu_shrinker, "x86-mmu");
-	if (ret)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   a                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         kvm_arch_nr_memslot_as_ids(kvm)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           *mmu_shrinker                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                mmu_shrinker = shrinker_alloc(0, "x86-mmu");
+	if (!mmu_shrinker)
 		goto out_shrinker;
 
-	return 0;
+	mmu_shrinker->count                      count;
+	mmu_shrinker->                              ;
+	mmu_shrinker->                          ;
 
-out_shrinker:
-	percpu_counter_destroy(&kvm_total_used_mmu_pages);
-out:
-	mmu_destroy_caches();
-	return ret;
-}
-
-void kvm_mmu_destroy(struct kvm_vcpu *vcpu)
-{
-	kvm_mmu_unload(vcpu);
-	free_mmu_pages(&vcpu->arch.root_mmu);
-	free_mmu_pages(&vcpu->arch.guest_mmu);
-	mmu_free_memory_caches(vcpu);
-}
-
-void kvm_mmu_vendor_module_exit(void)
-{
-	mmu_destroy_caches();
-	percpu_counter_destroy(&kvm_total_used_mmu_pages);
-	unregister_shrinker(&mmu_shrinker);
-}
-
-/*
- * Calculate the effective recovery period, accounting for '0' meaning "let KVM
- * select a halving time of 1 hour".  Returns true if recovery is enabled.
- */
-static bool calc_nx_huge_pages_recovery_period(uint *period)
+	shrinker_register(mmu_shrinker)                                                                                                                                                                                                                                                                                                                                                                                                                                       shrinker_free(                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+#ifdef CONFIG_KVM_GENERIC_MEMORY_ATTRIBUTES
+bool kvm_arch_pre_set_memory_attributes                       struct kvm_gfn_range *range)
 {
 	/*
-	 * Use READ_ONCE to get the params, this may be called outside of the
-	 * param setters, e.g. by the kthread to compute its next timeout.
-	 */
-	bool enabled = READ_ONCE(nx_huge_pages);
-	uint ratio = READ_ONCE(nx_huge_pages_recovery_ratio);
-
-	if (!enabled || !ratio)
+	 * Zap SPTEs even if the slot can't be mapped PRIVATE.  KVM x86 only
+	 * supports KVM_MEMORY_ATTRIBUTE_PRIVATE, and so it *seems* like KVM
+	 * can simply ignore such slots.  But if userspace is making memory
+	 * PRIVATE, then KVM must prevent the guest from accessing the memory
+	 * as shared.  And if userspace is making memory SHARED and this point
+	 * is reached, then at least one page within the range was previously
+	 * PRIVATE, i.e. the slot's possible hugepage ranges are changing.
+	 * Zapping SPTEs in this case ensures KVM will reassess whether or not
+	 * a hugepage can be used for affected ranges                         !kvm_arch_has_private_mem(kvm)))
 		return false;
 
-	*period = READ_ONCE(nx_huge_pages_recovery_period_ms);
-	if (!*period) {
-		/* Make sure the period is not less than one second.  */
-		ratio = min(ratio, 3600u);
-		*period = 60 * 60 * 1000 / ratio;
+	       kvm_unmap_gfn_range(kvm, range);
+}
+
+static bool hugepage_test_mixed(struct kvm_memory_slot *slot, gfn_t gfn,
+				int level)
+{
+	return lpage_info_slot(gfn, slot, level)->disallow_lpage & KVM_LPAGE_MIXED_FLAG;
+}
+
+static void hugepage_clear_mixed(struct kvm_memory_slot *slot, gfn_t gfn,
+				 int level)
+{
+	lpage_info_slot(gfn, slot, level)->disallow_lpage &= ~KVM_LPAGE_MIXED_FLAG;
+}
+
+static void hugepage_set_mixed(struct kvm_memory_slot *slot, gfn_t gfn,
+			       int level)
+{
+	lpage_info_slot(gfn, slot, level)->disallow_lpage |= KVM_LPAGE_MIXED_FLAG;
+}
+
+static bool hugepage_has_attrs(struct kvm *kvm, struct kvm_memory_slot *slot,
+			       gfn_t gfn, int level, unsigned long attrs)
+{
+	const unsigned long start = gfn;
+	const unsigned long end = start + KVM_PAGES_PER_HPAGE(level);
+
+	if (level == PG_LEVEL_2M)
+		return kvm_range_has_memory_attributes(kvm, start, end, attrs);
+
+	for (gfn = start; gfn < end; gfn += KVM_PAGES_PER_HPAGE(level - 1)) {
+		if (hugepage_test_mixed(slot, gfn, level - 1) ||
+		    attrs != kvm_get_memory_attributes(kvm, gfn))
+			return false;
 	}
 	return true;
 }
 
-static int set_nx_huge_pages_recovery_param(const char *val, const struct kernel_param *kp)
+bool kvm_arch_post_set_memory_attributes                                   gfn_range *range)
 {
-	bool was_recovery_enabled, is_recovery_enabled;
-	uint old_period, new_period;
-	int err;
+	unsigned long attrs = range->arg.attribute                                 = range->slot;
+	int level                                                                                         /*
+	 * Calculate which ranges can be mapped with hugepages even if the slot
+	 * can't map memory PRIVATE.  KVM mustn't create a SHARED hugepage over
+	 * a range that has PRIVATE GFNs, and conversely converting a range to
+	 * SHARED may now allow hugepages                         !kvm_arch_has_private_mem(kvm)))
+		return false;
 
-	was_recovery_enabled = calc_nx_huge_pages_recovery_period(&old_period);
+	       The sequence matters here: upper levels consume the result of lower
+	 * level's scanning                                  level <= KVM_MAX_HUGEPAGE_LEVEL; level++) {
+		gfn_t nr_pages = KVM_PAGES_PER_HPAGE(level);
+		gfn_t gfn = gfn_round_for_level(range->start, level);
 
-	err = param_set_uint(val, kp);
-	if (err)
-		return err;
-
-	is_recovery_enabled = calc_nx_huge_pages_recovery_period(&new_period);
-
-	if (is_recovery_enabled &&
-	    (!was_recovery_enabled || old_period > new_period)) {
-		struct kvm *kvm;
-
-		mutex_lock(&kvm_lock);
-
-		list_for_each_entry(kvm, &vm_list, vm_list)
-			wake_up_process(kvm->arch.nx_huge_page_recovery_thread);
-
-		mutex_unlock(&kvm_lock);
-	}
-
-	return err;
-}
-
-static void kvm_recover_nx_huge_pages(struct kvm *kvm)
-{
-	unsigned long nx_lpage_splits = kvm->stat.nx_lpage_splits;
-	struct kvm_memory_slot *slot;
-	int rcu_idx;
-	struct kvm_mmu_page *sp;
-	unsigned int ratio;
-	LIST_HEAD(invalid_list);
-	bool flush = false;
-	ulong to_zap;
-
-	rcu_idx = srcu_read_lock(&kvm->srcu);
-	write_lock(&kvm->mmu_lock);
-
-	/*
-	 * Zapping TDP MMU shadow pages, including the remote TLB flush, must
-	 * be done under RCU protection, because the pages are freed via RCU
-	 * callback.
-	 */
-	rcu_read_lock();
-
-	ratio = READ_ONCE(nx_huge_pages_recovery_ratio);
-	to_zap = ratio ? DIV_ROUND_UP(nx_lpage_splits, ratio) : 0;
-	for ( ; to_zap; --to_zap) {
-		if (list_empty(&kvm->arch.possible_nx_huge_pages))
-			break;
+		/* Process the head page if it straddles the range. */
+		if (gfn != range->start || gfn + nr_pages > range->end) {
+			/*
+			 * Skip mixed tracking if the aligned gfn isn't covered
+			 * by the memslot, KVM can't use a hugepage due to the
+			 * misaligned address regardless of memory attributes.
+			 */
+			if (gfn >= slot->base_gfn) {
+				if (hugepage_has_attrs(kvm, slot, gfn, level, attrs))
+					hugepage_clear_mixed(slot, gfn, level);
+				else
+					hugepage_set_mixed(slot, gfn, level);
+			}
+			gfn += nr_pages;
+		}
 
 		/*
-		 * We use a separate list instead of just using active_mmu_pages
-		 * because the number of shadow pages that be replaced with an
-		 * NX huge page is expected to be relatively small compared to
-		 * the total number of shadow pages.  And because the TDP MMU
-		 * doesn't use active_mmu_pages.
+		 * Pages entirely covered by the range are guaranteed to have
+		 * only the attributes which were just set.
 		 */
-		sp = list_first_entry(&kvm->arch.possible_nx_huge_pages,
-				      struct kvm_mmu_page,
-				      possible_nx_huge_page_link);
-		WARN_ON_ONCE(!sp->nx_huge_page_disallowed);
-		WARN_ON_ONCE(!sp->role.direct);
+		for ( ; gfn + nr_pages <= range->end; gfn += nr_pages)
+			hugepage_clear_mixed(slot, gfn, level);
 
 		/*
-		 * Unaccount and do not attempt to recover any NX Huge Pages
-		 * that are being dirty tracked, as they would just be faulted
-		 * back in as 4KiB pages. The NX Huge Pages in this slot will be
-		 * recovered, along with all the other huge pages in the slot,
-		 * when dirty logging is disabled.
-		 *
-		 * Since gfn_to_memslot() is relatively expensive, it helps to
-		 * skip it if it the test cannot possibly return true.  On the
-		 * other hand, if any memslot has logging enabled, chances are
-		 * good that all of them do, in which case unaccount_nx_huge_page()
-		 * is much cheaper than zapping the page.
-		 *
-		 * If a memslot update is in progress, reading an incorrect value
-		 * of kvm->nr_memslots_dirty_logging is not a problem: if it is
-		 * becoming zero, gfn_to_memslot() will be done unnecessarily; if
-		 * it is becoming nonzero, the page will be zapped unnecessarily.
-		 * Either way, this only affects efficiency in racy situations,
-		 * and not correctness.
+		 * Process the last tail page if it straddles the range and is
+		 * contained by the memslot.  Like the head page, KVM can't
+		 * create a hugepage if the slot size is misaligned.
 		 */
-		slot = NULL;
-		if (atomic_read(&kvm->nr_memslots_dirty_logging)) {
-			struct kvm_memslots *slots;
-
-			slots = kvm_memslots_for_spte_role(kvm, sp->role);
-			slot = __gfn_to_memslot(slots, sp->gfn);
-			WARN_ON_ONCE(!slot);
+		if (gfn < range->end &&
+		    (gfn + nr_pages) <= (slo                          )) {
+			if (hugepage_has_attrs(kvm, slot, gfn, level, attrs))
+				hugepage_clear_mixed(slot, gfn, level);
+			else
+				hugepage_set_mixed(slot, gfn, level);
 		}
+	}                                init_memslot_memory_attributes                                      memory_slot *slot     int level;
 
-		if (slot && kvm_slot_dirty_track_enabled(slot))
-			unaccount_nx_huge_page(kvm, sp);
-		else if (is_tdp_mmu_page(sp))
-			flush |= kvm_tdp_mmu_zap_sp(kvm, sp);
-		else
-			kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list);
-		WARN_ON_ONCE(sp->nx_huge_page_disallowed);
+	if (!kvm_arch_has_private_mem(kvm))
+		return;
 
-		if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
-			kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, flush);
-			rcu_read_unlock();
+	for (                     level <= KVM_MAX_HUGEPAGE_LEVEL; level++) {
+		/*
+		 * Don't bother tracking mixed attributes for pages that can't
+		 * be huge due to alignment, i.e. process only pages that are
+		 * entirely contained by the memslot.
+		 */
+		gfn_t end = gfn_round_for_level(                             , level);
+		gfn_t start = gfn_round_for_level(slot->base_gfn, level);
+		gfn_t nr_pages = KVM_PAGES_PER_HPAGE(level);
+		gfn_t gfn;
 
-			cond_resched_rwlock_write(&kvm->mmu_lock);
-			flush = false;
+		if (start < slot->base_gfn)
+			start += nr_pages;
 
-			rcu_read_lock();
+		/*
+		 * Unlike setting attributes, every potential hugepage needs to
+		 * be manually checked as the attributes may already be mixed.
+		 */
+		for (gfn = start; gfn < end; gfn += nr_pages) {
+			unsigned long attrs = kvm_get_memory_attributes(kvm, gfn);
+
+			if (hugepage_has_attrs(kvm, slot, gfn, level, attrs))
+				hugepage_clear_mixed(slot, gfn, level);
+			else
+				hugepage_set_mixed(slot, gfn, level);
 		}
 	}
-	kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, flush);
-
-	rcu_read_unlock();
-
-	write_unlock(&kvm->mmu_lock);
-	srcu_read_unlock(&kvm->srcu, rcu_idx);
 }
-
-static long get_nx_huge_page_recovery_timeout(u64 start_time)
-{
-	bool enabled;
-	uint period;
-
-	enabled = calc_nx_huge_pages_recovery_period(&period);
-
-	return enabled ? start_time + msecs_to_jiffies(period) - get_jiffies_64()
-		       : MAX_SCHEDULE_TIMEOUT;
-}
-
-static int kvm_nx_huge_page_recovery_worker(struct kvm *kvm, uintptr_t data)
-{
-	u64 start_time;
-	long remaining_time;
-
-	while (true) {
-		start_time = get_jiffies_64();
-		remaining_time = get_nx_huge_page_recovery_timeout(start_time);
-
-		set_current_state(TASK_INTERRUPTIBLE);
-		while (!kthread_should_stop() && remaining_time > 0) {
-			schedule_timeout(remaining_time);
-			remaining_time = get_nx_huge_page_recovery_timeout(start_time);
-			set_current_state(TASK_INTERRUPTIBLE);
-		}
-
-		set_current_state(TASK_RUNNING);
-
-		if (kthread_should_stop())
-			return 0;
-
-		kvm_recover_nx_huge_pages(kvm);
-	}
-}
-
-int kvm_mmu_post_init_vm(struct kvm *kvm)
-{
-	int err;
-
-	err = kvm_vm_create_worker_thread(kvm, kvm_nx_huge_page_recovery_worker, 0,
-					  "kvm-nx-lpage-recovery",
-					  &kvm->arch.nx_huge_page_recovery_thread);
-	if (!err)
-		kthread_unpark(kvm->arch.nx_huge_page_recovery_thread);
-
-	return err;
-}
-
-void kvm_mmu_pre_destroy_vm(struct kvm *kvm)
-{
-	if (kvm->arch.nx_huge_page_recovery_thread)
-		kthread_stop(kvm->arch.nx_huge_page_recovery_thread);
-}
+#endif

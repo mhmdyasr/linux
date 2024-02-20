@@ -9,10 +9,7 @@ ALL_TESTS="
 	num_grat_arp
 "
 
-REQUIRE_MZ=no
-NUM_NETIFS=0
 lib_dir=$(dirname "$0")
-source ${lib_dir}/net_forwarding_lib.sh
 source ${lib_dir}/bond_topo_3d1c.sh
 
 skip_prio()
@@ -165,7 +162,7 @@ prio_arp()
 	local mode=$1
 
 	for primary_reselect in 0 1 2; do
-		prio_test "mode active-backup arp_interval 100 arp_ip_target ${g_ip4} primary eth1 primary_reselect $primary_reselect"
+		prio_test "mode $mode arp_interval 100 arp_ip_target ${g_ip4} primary eth1 primary_reselect $primary_reselect"
 		log_test "prio" "$mode arp_ip_target primary_reselect $primary_reselect"
 	done
 }
@@ -181,7 +178,7 @@ prio_ns()
 	fi
 
 	for primary_reselect in 0 1 2; do
-		prio_test "mode active-backup arp_interval 100 ns_ip6_target ${g_ip6} primary eth1 primary_reselect $primary_reselect"
+		prio_test "mode $mode arp_interval 100 ns_ip6_target ${g_ip6} primary eth1 primary_reselect $primary_reselect"
 		log_test "prio" "$mode ns_ip6_target primary_reselect $primary_reselect"
 	done
 }
@@ -197,9 +194,9 @@ prio()
 
 	for mode in $modes; do
 		prio_miimon $mode
-		prio_arp $mode
-		prio_ns $mode
 	done
+	prio_arp "active-backup"
+	prio_ns "active-backup"
 }
 
 arp_validate_test()
